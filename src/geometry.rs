@@ -78,6 +78,8 @@ impl Rect {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Layout {
     pub monitors: Vec<Rect>,
+    /// Output names, parallel to `monitors` (may be empty in tests).
+    pub names: Vec<String>,
 }
 
 const TOL: f64 = 1.5;
@@ -85,6 +87,40 @@ const TOL: f64 = 1.5;
 const INSET: f64 = 3.0;
 
 impl Layout {
+    /// Only the monitors named in `only` (all of them if `only` is empty or
+    /// matches nothing).
+    pub fn sub(&self, only: &[String]) -> Layout {
+        if only.is_empty() {
+            return self.clone();
+        }
+        let (mut monitors, mut names) = (Vec::new(), Vec::new());
+        for (m, n) in self.monitors.iter().zip(&self.names) {
+            if only.iter().any(|o| o == n) {
+                monitors.push(*m);
+                names.push(n.clone());
+            }
+        }
+        if monitors.is_empty() {
+            return self.clone();
+        }
+        Layout { monitors, names }
+    }
+
+    /// Like `at_edge`, but only the edge of the monitors in `only` counts, and
+    /// the fraction is along those monitors. Seams to monitors left out of
+    /// `only` still don't count as edges.
+    pub fn at_edge_on(&self, side: Side, x: f64, y: f64, only: &[String]) -> Option<f64> {
+        let frac = self.at_edge(side, x, y)?;
+        if only.is_empty() {
+            return Some(frac);
+        }
+        let sub = self.sub(only);
+        if !sub.monitors.iter().any(|m| m.contains(x, y)) {
+            return None;
+        }
+        Some(sub.frac_of(side, x, y))
+    }
+
     fn bbox(&self) -> Rect {
         let mut it = self.monitors.iter();
         let Some(first) = it.next() else {
@@ -225,7 +261,25 @@ mod tests {
     fn two_side_by_side() -> Layout {
         Layout {
             monitors: vec![r(0.0, 0.0, 2560.0, 1440.0), r(2560.0, 0.0, 2560.0, 1440.0)],
+            names: vec!["HDMI".into(), "DP".into()],
         }
+    }
+
+    #[test]
+    fn edge_limited_to_one_monitor() {
+        let l = two_side_by_side();
+        let dp = ["DP".to_string()];
+        // Bottom edge of the left monitor doesn't count…
+        assert_eq!(l.at_edge_on(Side::Bottom, 1000.0, 1439.0, &dp), None);
+        // …the right one's does, measured along that monitor only.
+        let f = l
+            .at_edge_on(Side::Bottom, 2560.0 + 640.0, 1439.0, &dp)
+            .unwrap();
+        assert!((f - 0.25).abs() < 1e-3);
+        // Entering lands on the right monitor, rising from its bottom.
+        assert_eq!(l.sub(&dp).entry_point(Side::Bottom, 0.5), (3840.0, 1436.0));
+        // The seam between the two is still not an edge.
+        assert_eq!(l.at_edge_on(Side::Left, 2560.0, 700.0, &dp), None);
     }
 
     #[test]
@@ -261,6 +315,7 @@ mod tests {
         // Tall monitor on the left, short one on the right.
         let l = Layout {
             monitors: vec![r(0.0, 0.0, 1000.0, 2000.0), r(1000.0, 0.0, 1000.0, 500.0)],
+            names: vec![],
         };
         // Low on the right edge there's only the tall monitor's right side…
         assert!(l.at_edge(Side::Right, 999.0, 1500.0).is_some());

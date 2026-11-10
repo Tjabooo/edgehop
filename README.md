@@ -85,6 +85,8 @@ address = "192.168.1.30:24801"   # dial the laptop
 | `ignore_devices` | `[]` | Device names (case-insensitive substring) never captured. |
 | `[[peers]] name` | (required) | The peer's `name`. |
 | `[[peers]] side` | (required) | `left`, `right`, `top` or `bottom`: where its screens are, seen from here. |
+| `[[peers]] monitors` | `[]` (all) | Only these outputs' edges lead to the peer, e.g. `["DP-3"]`: arrivals land on that monitor and only its edge leads back. |
+| `[[peers]] edge_delay_ms` | `0` | Keep pushing against the edge this long before crossing, so a quick flick to a bar on that edge doesn't throw you over. |
 | `[[peers]] address` | none | `host[:port]` to dial. One side dialing is enough. |
 
 `edgehop check` shows which devices will be captured, whether `/dev/uinput` is writable, your screen layout, and how far the cursor is from each peer's edge.

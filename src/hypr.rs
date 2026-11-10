@@ -32,6 +32,8 @@ struct CursorPos {
 
 #[derive(Deserialize)]
 struct Monitor {
+    #[serde(default)]
+    name: String,
     x: f64,
     y: f64,
     width: f64,
@@ -131,9 +133,13 @@ impl Hypr {
         let out = self.request("j/monitors").await?;
         let mons: Vec<Monitor> =
             serde_json::from_str(&out).with_context(|| format!("monitors: {out}"))?;
-        let monitors: Vec<Rect> = mons
+        let mons: Vec<&Monitor> = mons
             .iter()
             .filter(|m| !m.disabled && m.scale > 0.0)
+            .collect();
+        let names: Vec<String> = mons.iter().map(|m| m.name.clone()).collect();
+        let monitors: Vec<Rect> = mons
+            .iter()
             .map(|m| {
                 let (mut w, mut h) = ((m.width / m.scale).round(), (m.height / m.scale).round());
                 if m.transform % 2 == 1 {
@@ -150,7 +156,7 @@ impl Hypr {
         if monitors.is_empty() {
             return Err(anyhow!("no monitors"));
         }
-        let layout = Layout { monitors };
+        let layout = Layout { monitors, names };
         self.layout = Some((Instant::now(), layout.clone()));
         Ok(layout)
     }

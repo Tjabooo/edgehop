@@ -111,6 +111,8 @@ struct Daemon {
     /// else this machine's compositor would never see them released.
     pending_switch: Option<(String, Side, Instant)>,
     notifier: crate::notify::Notifier,
+    /// Edge delay: (peer, first push against the edge, latest push).
+    edge_push: Option<(String, Instant, Instant)>,
     ways_back: String,
 }
 
@@ -254,6 +256,7 @@ pub async fn run(cfg: Config) -> Result<()> {
         back_watch: EdgeWatch::new(),
         pending_switch: None,
         notifier,
+        edge_push: None,
         ways_back,
     };
 
@@ -478,11 +481,11 @@ impl Daemon {
         };
         let dist = targets
             .iter()
-            .map(|(_, s)| layout.distance_to(*s, x, y))
+            .map(|(p, s)| layout.sub(&self.peer_monitors(p)).distance_to(*s, x, y))
             .fold(f64::MAX, f64::min);
         self.out_watch.after_query(dist);
         for (peer, side) in targets {
-            let Some(frac) = layout.at_edge(side, x, y) else {
+            let Some(frac) = layout.at_edge_on(side, x, y, &self.peer_monitors(&peer)) else {
                 continue;
             };
             if self.devices.values().any(|d| d.state.anything_held()) {
@@ -493,9 +496,43 @@ impl Daemon {
                 log::debug!("at {side:?} edge but a fullscreen window is focused");
                 return;
             }
+            // Edge delay: keep pushing for a moment before crossing.
+            let delay = self
+                .cfg
+                .peers
+                .iter()
+                .find(|p| p.name == peer)
+                .map_or(0, |p| p.edge_delay_ms);
+            if delay > 0 {
+                let now = Instant::now();
+                let first = match &self.edge_push {
+                    Some((p, first, last))
+                        if *p == peer && now.duration_since(*last) < Duration::from_millis(120) =>
+                    {
+                        *first
+                    }
+                    _ => now,
+                };
+                self.edge_push = Some((peer.clone(), first, now));
+                if now.duration_since(first) < Duration::from_millis(delay) {
+                    return;
+                }
+            }
+            self.edge_push = None;
             self.start_control(peer, side, frac).await;
             return;
         }
+        // Not at any peer's edge (every crossing path above returns).
+        self.edge_push = None;
+    }
+
+    fn peer_monitors(&self, peer: &str) -> Vec<String> {
+        self.cfg
+            .peers
+            .iter()
+            .find(|p| p.name == peer)
+            .map(|p| p.monitors.clone())
+            .unwrap_or_default()
     }
 
     fn release_combo_held(&self) -> bool {
@@ -586,7 +623,9 @@ impl Daemon {
         if let Some(frac) = back_at
             && let Ok(layout) = self.hypr.layout().await
         {
-            let (x, y) = layout.entry_point(c.side, frac);
+            let (x, y) = layout
+                .sub(&self.peer_monitors(&c.peer))
+                .entry_point(c.side, frac);
             if let Err(e) = self.hypr.warp(x, y).await {
                 log::warn!("{e:#}");
             }
@@ -667,7 +706,9 @@ impl Daemon {
                 self.back_watch = EdgeWatch::new();
                 match self.hypr.layout().await {
                     Ok(layout) => {
-                        let (x, y) = layout.entry_point(side, frac);
+                        let (x, y) = layout
+                            .sub(&self.peer_monitors(peer))
+                            .entry_point(side, frac);
                         if let Err(e) = self.hypr.warp(x, y).await {
                             log::warn!("{e:#}");
                         }
@@ -720,12 +761,11 @@ impl Daemon {
             self.back_watch.after_query(1000.0);
             return;
         };
-        self.back_watch.after_query(layout.distance_to(side, x, y));
-        log::debug!(
-            "return check: cursor {x},{y}, {:.0} px from the {side:?} edge",
-            layout.distance_to(side, x, y)
-        );
-        if let Some(frac) = layout.at_edge(side, x, y) {
+        let only = self.peer_monitors(peer);
+        let dist = layout.sub(&only).distance_to(side, x, y);
+        self.back_watch.after_query(dist);
+        log::debug!("return check: cursor {x},{y}, {dist:.0} px from the {side:?} edge");
+        if let Some(frac) = layout.at_edge_on(side, x, y, &only) {
             log::info!("→ handing back to {peer}");
             self.release_mirrors(peer);
             self.controlled_by = None;
@@ -759,7 +799,7 @@ impl Daemon {
         }
         self.pending_switch = None;
         let frac = match (self.hypr.cursor().await, self.hypr.layout().await) {
-            (Ok((x, y)), Ok(l)) => l.frac_of(side, x, y),
+            (Ok((x, y)), Ok(l)) => l.sub(&self.peer_monitors(&peer)).frac_of(side, x, y),
             _ => 0.5,
         };
         self.start_control(peer, side, frac).await;
@@ -770,7 +810,7 @@ impl Daemon {
         if let Some(cb) = self.controlled_by.take() {
             // Pressed on the controller's keyboard, run here: hand control back.
             let frac = match (self.hypr.cursor().await, self.hypr.layout().await) {
-                (Ok((x, y)), Ok(l)) => l.frac_of(cb.side, x, y),
+                (Ok((x, y)), Ok(l)) => l.sub(&self.peer_monitors(&cb.peer)).frac_of(cb.side, x, y),
                 _ => 0.5,
             };
             log::info!("→ handing back to {} (switch)", cb.peer);

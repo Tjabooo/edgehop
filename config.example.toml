@@ -32,6 +32,11 @@ ignore_devices = []
 name = "desktop"
 # Where its screens are, seen from here: left, right, top or bottom.
 side = "left"
+# Only these outputs' edges lead to it (names from `hyprctl monitors`); empty = all.
+# monitors = ["DP-1"]
+# Keep pushing against the edge this long (ms) before crossing, e.g. when a
+# bar sits on that edge.
+# edge_delay_ms = 150
 # Dial it here. Leave `address` out if that machine dials this one instead
 # (one side dialing is enough; the link carries both directions).
 # address = "192.168.1.20:24801"

@@ -48,6 +48,13 @@ pub struct PeerConfig {
     /// host:port to dial. Leave it out if the peer dials this machine.
     #[serde(default)]
     pub address: Option<String>,
+    /// Only these outputs' edges lead to the peer (e.g. ["DP-3"]); empty = all.
+    #[serde(default)]
+    pub monitors: Vec<String>,
+    /// Keep pushing against the edge this long before crossing (ms), so a
+    /// quick flick to a bar at that edge doesn't throw you over.
+    #[serde(default)]
+    pub edge_delay_ms: u64,
 }
 
 fn yes() -> bool {
