@@ -25,6 +25,13 @@ pub struct Config {
     /// Don't cross over while the focused window is fullscreen (games).
     #[serde(default = "yes")]
     pub block_when_fullscreen: bool,
+    /// Show desktop notifications on crossing (which machine has your input,
+    /// and how to get it back).
+    #[serde(default = "yes")]
+    pub notify: bool,
+    /// Your `edgehop switch` keybind, named in the notifications, e.g. "Super+Alt+K".
+    #[serde(default)]
+    pub switch_hint: Option<String>,
     /// Device names (substring, case-insensitive) that are never captured.
     #[serde(default)]
     pub ignore_devices: Vec<String>,

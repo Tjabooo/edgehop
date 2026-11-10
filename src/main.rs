@@ -4,6 +4,7 @@ mod devices;
 mod geometry;
 mod hypr;
 mod mirror;
+mod notify;
 mod proto;
 
 use std::path::PathBuf;

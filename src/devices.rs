@@ -553,6 +553,16 @@ impl InputState {
 mod tests {
     use super::*;
 
+    /// EDGEHOP_MIRROR_TEST=/dev/input/eventN cargo test dump_desc -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn dump_desc() {
+        let path = std::env::var("EDGEHOP_MIRROR_TEST").unwrap();
+        let dev = evdev::raw_stream::RawDevice::open(&path).unwrap();
+        let d = describe(&dev, Path::new(&path), &[]).unwrap();
+        println!("DESC {}", serde_json::to_string(&d).unwrap());
+    }
+
     fn k(c: u16, v: i32) -> Ev {
         Ev { t: EV_KEY, c, v }
     }

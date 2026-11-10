@@ -110,6 +110,8 @@ struct Daemon {
     /// `edgehop switch` waits for the keybind's keys to be let go first,
     /// else this machine's compositor would never see them released.
     pending_switch: Option<(String, Side, Instant)>,
+    notifier: crate::notify::Notifier,
+    ways_back: String,
 }
 
 pub fn socket_path() -> PathBuf {
@@ -236,6 +238,8 @@ pub async fn run(cfg: Config) -> Result<()> {
         }
     });
 
+    let notifier = crate::notify::Notifier::new(cfg.notify);
+    let ways_back = crate::notify::ways_back(&cfg.release_keys, cfg.switch_hint.as_deref());
     let mut d = Daemon {
         release_codes: cfg.release_codes()?,
         cfg,
@@ -249,6 +253,8 @@ pub async fn run(cfg: Config) -> Result<()> {
         out_watch: EdgeWatch::new(),
         back_watch: EdgeWatch::new(),
         pending_switch: None,
+        notifier,
+        ways_back,
     };
 
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
@@ -548,6 +554,8 @@ impl Daemon {
             .spawn()
             .map_err(|e| log::debug!("systemd-inhibit: {e}"))
             .ok();
+        self.notifier
+            .driving(&peer, side.opposite(), &self.ways_back);
         self.controlling = Some(Controlling {
             peer,
             side,
@@ -569,6 +577,7 @@ impl Daemon {
             let _ = child.start_kill();
         }
         log::info!("← back from {} ({why})", c.peer);
+        self.notifier.back(&self.cfg.name);
         if let Some(frac) = back_at
             && let Ok(layout) = self.hypr.layout().await
         {
@@ -644,6 +653,8 @@ impl Daemon {
                     return;
                 }
                 log::info!("← {peer} took over ({side:?} edge, {:.0}%)", frac * 100.0);
+                self.notifier
+                    .arrived(peer, &self.cfg.name, side, &self.ways_back);
                 self.controlled_by = Some(ControlledBy {
                     peer: peer.to_string(),
                     side,
@@ -705,6 +716,10 @@ impl Daemon {
             return;
         };
         self.back_watch.after_query(layout.distance_to(side, x, y));
+        log::debug!(
+            "return check: cursor {x},{y}, {:.0} px from the {side:?} edge",
+            layout.distance_to(side, x, y)
+        );
         if let Some(frac) = layout.at_edge(side, x, y) {
             log::info!("→ handing back to {peer}");
             self.release_mirrors(peer);
@@ -883,6 +898,8 @@ mod tests {
             psk: std::env::var("EDGEHOP_PROBE_PSK").unwrap(),
             release_keys: vec![],
             block_when_fullscreen: false,
+            notify: false,
+            switch_hint: None,
             ignore_devices: vec![],
             peers: vec![],
         }
@@ -895,7 +912,12 @@ mod tests {
         };
         let s = TcpStream::connect(addr).await.unwrap();
         let (mut r, mut w) = proto::handshake(s, &psk, true).await.unwrap();
-        w.send(&Msg::Hello { name: "probe".into(), version: PROTOCOL_VERSION }).await.unwrap();
+        w.send(&Msg::Hello {
+            name: "probe".into(),
+            version: PROTOCOL_VERSION,
+        })
+        .await
+        .unwrap();
         assert!(matches!(r.recv().await.unwrap(), Msg::Hello { .. }));
         let desc = DeviceDesc {
             name: "Probe mouse".into(),
@@ -919,7 +941,16 @@ mod tests {
         // Move inward a bit, then back out through the edge we came in by.
         let dir = if side == Side::Left { 1 } else { -1 };
         for _ in 0..20 {
-            w.send(&Msg::Input { id: 77, events: vec![Ev { t: 2, c: 0, v: 10 * dir }] }).await.unwrap();
+            w.send(&Msg::Input {
+                id: 77,
+                events: vec![Ev {
+                    t: 2,
+                    c: 0,
+                    v: 10 * dir,
+                }],
+            })
+            .await
+            .unwrap();
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         let back = async {
@@ -931,13 +962,123 @@ mod tests {
         };
         let pump = async {
             for _ in 0..400 {
-                w.send(&Msg::Input { id: 77, events: vec![Ev { t: 2, c: 0, v: -10 * dir }] }).await.unwrap();
+                w.send(&Msg::Input {
+                    id: 77,
+                    events: vec![Ev {
+                        t: 2,
+                        c: 0,
+                        v: -10 * dir,
+                    }],
+                })
+                .await
+                .unwrap();
                 tokio::time::sleep(Duration::from_millis(4)).await;
             }
         };
         tokio::select! {
             frac = back => assert!((frac - 0.5).abs() < 0.05, "came back at {frac}"),
             _ = pump => panic!("never handed back"),
+        }
+    }
+
+    /// Like the probe above, but a one-finger touchpad swipe through a copy
+    /// of a real touchpad (EDGEHOP_PROBE_DESC = JSON DeviceDesc file).
+    #[tokio::test]
+    #[ignore]
+    async fn probe_touchpad_return() {
+        let addr = std::env::var("EDGEHOP_PROBE_ADDR").unwrap();
+        let psk = crate::config::Config {
+            name: String::new(),
+            listen: None,
+            psk: std::env::var("EDGEHOP_PROBE_PSK").unwrap(),
+            release_keys: vec![],
+            block_when_fullscreen: false,
+            notify: false,
+            switch_hint: None,
+            ignore_devices: vec![],
+            peers: vec![],
+        }
+        .psk_bytes()
+        .unwrap();
+        let desc: DeviceDesc = serde_json::from_str(
+            &std::fs::read_to_string(std::env::var("EDGEHOP_PROBE_DESC").unwrap()).unwrap(),
+        )
+        .unwrap();
+        let ax = |c: u16| desc.abs.iter().find(|a| a.code == c).unwrap().clone();
+        let (xa, ya) = (ax(0x00), ax(0x01));
+        let s = TcpStream::connect(addr).await.unwrap();
+        let (mut r, mut w) = proto::handshake(s, &psk, true).await.unwrap();
+        w.send(&Msg::Hello {
+            name: "probe".into(),
+            version: PROTOCOL_VERSION,
+        })
+        .await
+        .unwrap();
+        assert!(matches!(r.recv().await.unwrap(), Msg::Hello { .. }));
+        w.send(&Msg::AddDevice { id: 78, desc }).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+        w.send(&Msg::Enter {
+            side: Side::Right,
+            frac: 0.5,
+        })
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let ev = |t: u16, c: u16, v: i32| Ev { t, c, v };
+        let back = async {
+            loop {
+                if let Msg::Released { frac } = r.recv().await.unwrap() {
+                    return frac;
+                }
+            }
+        };
+        let swipes = async {
+            let y = (ya.min + ya.max) / 2;
+            let mut tid = 100;
+            let mut ts = 0i32;
+            for swipe in 0..6 {
+                tid += 1;
+                // First swipe goes left (away from the edge), then right, repeatedly.
+                let (from, to) = if swipe == 0 { (0.7, 0.3) } else { (0.2, 0.9) };
+                let steps = 40;
+                for i in 0..=steps {
+                    let f = from + (to - from) * i as f64 / steps as f64;
+                    let x = xa.min + ((xa.max - xa.min) as f64 * f) as i32;
+                    let mut e = vec![ev(3, 0x2f, 0)];
+                    if i == 0 {
+                        e.push(ev(3, 0x39, tid));
+                    }
+                    e.push(ev(3, 0x35, x));
+                    e.push(ev(3, 0x36, y));
+                    if i == 0 {
+                        e.push(ev(1, 0x14a, 1));
+                        e.push(ev(1, 0x145, 1));
+                    }
+                    e.push(ev(3, 0x00, x));
+                    e.push(ev(3, 0x01, y));
+                    ts += 8000;
+                    e.push(ev(4, 5, ts)); // MSC_TIMESTAMP
+                    w.send(&Msg::Input { id: 78, events: e }).await.unwrap();
+                    tokio::time::sleep(Duration::from_millis(8)).await;
+                }
+                let lift = vec![
+                    ev(3, 0x2f, 0),
+                    ev(3, 0x39, -1),
+                    ev(1, 0x14a, 0),
+                    ev(1, 0x145, 0),
+                ];
+                w.send(&Msg::Input {
+                    id: 78,
+                    events: lift,
+                })
+                .await
+                .unwrap();
+                tokio::time::sleep(Duration::from_millis(120)).await;
+            }
+        };
+        tokio::select! {
+            frac = back => println!("handed back at {frac}"),
+            _ = swipes => panic!("never handed back"),
         }
     }
 }

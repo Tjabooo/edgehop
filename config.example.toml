@@ -18,6 +18,12 @@ release_keys = ["KEY_LEFTCTRL", "KEY_LEFTALT", "KEY_ESC"]
 # Don't cross over while the focused window is fullscreen (games).
 block_when_fullscreen = true
 
+# Desktop notifications on crossing: which machine has your input, how to get back.
+notify = true
+
+# Name your `edgehop switch` keybind here and the notifications mention it.
+# switch_hint = "Super+Alt+K"
+
 # Devices never captured (case-insensitive substring of the device name).
 ignore_devices = []
 

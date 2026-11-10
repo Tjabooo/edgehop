@@ -19,6 +19,7 @@ edgehop links two (or more) Linux machines running Hyprland. Move the pointer of
   - Crossing waits until no key or button is held.
   - Power, sleep and suspend keys are never forwarded.
   - No crossing while a fullscreen window (a game) is focused.
+- **Always know the way home.** While your input is away, a persistent notification says where it is and how to come back. The machine it arrives at shows a short hint too.
 - **Keybind switching.** `edgehop switch` jumps over without the edge, and the same bind brings you back.
 - **No idle lock while away.** While you drive another machine, the local one holds a systemd idle inhibitor, so hypridle doesn't lock or suspend it under you.
 - **Hotplug.** Devices plugged in later are picked up within a couple of seconds.
@@ -79,6 +80,8 @@ address = "192.168.1.30:24801"   # dial the laptop
 | `psk` | (required) | Shared 32-byte key, base64. `edgehop keygen` makes one. Keep the file `chmod 600`. |
 | `release_keys` | `["KEY_LEFTCTRL","KEY_LEFTALT","KEY_ESC"]` | Held together while driving another machine: snap back home. Names are Linux `KEY_*` codes. |
 | `block_when_fullscreen` | `true` | Don't cross over while the focused window is fullscreen. |
+| `notify` | `true` | Desktop notifications on crossing: a persistent "Driving …" note on the machine whose input is away, and a short hint on the machine it arrived at, both saying how to get back. |
+| `switch_hint` | none | Your `edgehop switch` keybind (e.g. `"Super+Alt+K"`), named in those notifications. |
 | `ignore_devices` | `[]` | Device names (case-insensitive substring) never captured. |
 | `[[peers]] name` | (required) | The peer's `name`. |
 | `[[peers]] side` | (required) | `left`, `right`, `top` or `bottom`: where its screens are, seen from here. |
