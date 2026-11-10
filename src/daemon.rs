@@ -572,6 +572,11 @@ impl Daemon {
             if let Err(e) = devices::set_grab(&d.grab_fd, false) {
                 log::warn!("ungrab {}: {e}", d.desc.name);
             }
+            if d.desc.touchpad
+                && let Err(e) = devices::resync_touchpad(&d.path, &d.grab_fd, &d.desc.keys)
+            {
+                log::warn!("resync {}: {e}", d.desc.name);
+            }
         }
         if let Some(mut child) = c.inhibit.take() {
             let _ = child.start_kill();

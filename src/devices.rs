@@ -180,6 +180,88 @@ fn event_number(p: &Path) -> u32 {
         .unwrap_or(u32::MAX)
 }
 
+/// Touch "tool" keys libinput uses to count fingers on a touchpad.
+const TOUCH_TOOL_KEYS: &[u16] = &[
+    0x14a, // BTN_TOUCH
+    0x145, // BTN_TOOL_FINGER
+    0x14d, // BTN_TOOL_DOUBLETAP
+    0x14e, // BTN_TOOL_TRIPLETAP
+    0x14f, // BTN_TOOL_QUADTAP
+    0x148, // BTN_TOOL_QUINTTAP
+];
+
+/// One frame that walks every touch tool key the device has through the
+/// opposite value and back to its real one. The kernel drops "no change"
+/// events, so this is the only way to make other readers see the true state.
+pub fn touch_resync_frame(caps: &[u16], held: impl Fn(u16) -> bool) -> Vec<Ev> {
+    let mut out = Vec::new();
+    for &c in TOUCH_TOOL_KEYS.iter().filter(|c| caps.contains(c)) {
+        let now = held(c) as i32;
+        out.push(Ev {
+            t: EV_KEY,
+            c,
+            v: 1 - now,
+        });
+        out.push(Ev {
+            t: EV_KEY,
+            c,
+            v: now,
+        });
+    }
+    if !out.is_empty() {
+        out.push(Ev {
+            t: EV_SYN,
+            c: SYN_REPORT,
+            v: 0,
+        });
+    }
+    out
+}
+
+/// After a grab ends, the compositor's libinput still holds the touchpad
+/// state from when the grab began: it never saw the finger-count changes in
+/// between, and ends up with an impossible state ("Invalid fake finger
+/// state") that breaks multi-finger gestures. Re-send the real state.
+pub fn resync_touchpad(path: &Path, fd: &OwnedFd, caps: &[u16]) -> std::io::Result<()> {
+    // EVIOCGKEY(len) = _IOR('E', 0x18, len)
+    let mut bits = [0u8; 96];
+    let req: libc::c_ulong = (2 << 30) | ((bits.len() as libc::c_ulong) << 16) | (0x45 << 8) | 0x18;
+    // SAFETY: the kernel writes at most bits.len() bytes into our buffer.
+    let r = unsafe { libc::ioctl(fd.as_raw_fd(), req as _, bits.as_mut_ptr()) };
+    if r < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let held = |c: u16| {
+        bits.get(c as usize / 8)
+            .is_some_and(|b| b >> (c % 8) & 1 == 1)
+    };
+    let frame = touch_resync_frame(caps, held);
+    if frame.is_empty() {
+        return Ok(());
+    }
+    let mut raw = Vec::with_capacity(frame.len() * std::mem::size_of::<libc::input_event>());
+    for e in frame {
+        let ie = libc::input_event {
+            time: libc::timeval {
+                tv_sec: 0,
+                tv_usec: 0,
+            },
+            type_: e.t,
+            code: e.c,
+            value: e.v,
+        };
+        // SAFETY: input_event is plain old data.
+        raw.extend_from_slice(unsafe {
+            std::slice::from_raw_parts(&ie as *const _ as *const u8, std::mem::size_of_val(&ie))
+        });
+    }
+    use std::io::Write;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)?
+        .write_all(&raw)
+}
+
 /// EVIOCGRAB = _IOW('E', 0x90, int)
 const EVIOCGRAB: libc::c_ulong = 0x4004_4590;
 
@@ -568,6 +650,17 @@ mod tests {
     }
     fn a(c: u16, v: i32) -> Ev {
         Ev { t: EV_ABS, c, v }
+    }
+
+    #[test]
+    fn resync_frame_ends_on_real_state() {
+        let caps = [0x110, 0x14a, 0x145, 0x14d];
+        let f = touch_resync_frame(&caps, |c| c == 0x145);
+        assert_eq!(f.len(), 7);
+        assert_eq!(f[2], k(0x145, 0));
+        assert_eq!(f[3], k(0x145, 1));
+        assert_eq!(f[5], k(0x14d, 0));
+        assert!(touch_resync_frame(&[0x110], |_| false).is_empty());
     }
 
     #[test]
