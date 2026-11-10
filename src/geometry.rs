@@ -89,6 +89,16 @@ const INSET: f64 = 3.0;
 impl Layout {
     /// Only the monitors named in `only` (all of them if `only` is empty or
     /// matches nothing).
+    /// Name of the output the point is on (strictly inside, so a point on
+    /// the seam between two outputs picks one).
+    pub fn monitor_at(&self, x: f64, y: f64) -> Option<&str> {
+        self.monitors
+            .iter()
+            .position(|m| x >= m.x && x < m.right() && y >= m.y && y < m.bottom())
+            .and_then(|i| self.names.get(i))
+            .map(String::as_str)
+    }
+
     pub fn sub(&self, only: &[String]) -> Layout {
         if only.is_empty() {
             return self.clone();
@@ -252,6 +262,31 @@ impl Layout {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn monitor_under_point() {
+        let l = Layout {
+            monitors: vec![
+                Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    w: 2560.0,
+                    h: 1440.0,
+                },
+                Rect {
+                    x: 2560.0,
+                    y: 0.0,
+                    w: 2560.0,
+                    h: 1440.0,
+                },
+            ],
+            names: vec!["HDMI-A-1".into(), "DP-3".into()],
+        };
+        assert_eq!(l.monitor_at(10.0, 10.0), Some("HDMI-A-1"));
+        assert_eq!(l.monitor_at(2560.0, 700.0), Some("DP-3"));
+        assert_eq!(l.monitor_at(5119.0, 1439.0), Some("DP-3"));
+        assert_eq!(l.monitor_at(6000.0, 10.0), None);
+    }
+
     use super::*;
 
     fn r(x: f64, y: f64, w: f64, h: f64) -> Rect {

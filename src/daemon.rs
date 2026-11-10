@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream, UnixListener};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::config::Config;
 use crate::devices::{self, DevEvent, InputState};
@@ -17,6 +17,7 @@ use crate::geometry::Side;
 use crate::hypr::Hypr;
 use crate::mirror::Mirror;
 use crate::proto::{self, DeviceDesc, Ev, Msg, PROTOCOL_VERSION};
+use crate::view::{self, Task};
 
 const PING_EVERY: Duration = Duration::from_secs(1);
 const DEAD_AFTER: Duration = Duration::from_secs(4);
@@ -27,6 +28,19 @@ enum NetEvent {
         peer: String,
         conn: u64,
         tx: mpsc::UnboundedSender<Msg>,
+        initiator: bool,
+    },
+    /// A remote-view video link came up (dialed by us or by the peer).
+    VideoLink {
+        peer: String,
+        session: u64,
+        r: proto::Reader,
+        w: proto::Writer,
+    },
+    /// A remote-view stream (either role) stopped by itself.
+    ViewEnded {
+        session: u64,
+        why: String,
     },
     Msg {
         peer: String,
@@ -54,7 +68,28 @@ struct LocalDev {
 struct Link {
     conn: u64,
     tx: mpsc::UnboundedSender<Msg>,
+    /// We dialed this link; video links get dialed the same way.
+    initiator: bool,
 }
+
+/// Viewer: we're showing `peer`'s screen.
+struct Viewing {
+    peer: String,
+    session: u64,
+    task: Option<Task>,
+}
+
+/// Watched: we're streaming our screen to `peer`.
+struct Serving {
+    peer: String,
+    session: u64,
+    capture: Vec<String>,
+    monitor: watch::Sender<String>,
+    task: Option<Task>,
+}
+
+const FOLLOW_EVERY: Duration = Duration::from_millis(40);
+const FOLLOW_TICK: Duration = Duration::from_millis(100);
 
 /// Rate-limits cursor queries: often near an edge, rarely far from it.
 struct EdgeWatch {
@@ -114,6 +149,14 @@ struct Daemon {
     /// Edge delay: (peer, first push against the edge, latest push).
     edge_push: Option<(String, Instant, Instant)>,
     ways_back: String,
+    psk: [u8; 32],
+    net_tx: mpsc::UnboundedSender<NetEvent>,
+    /// Remote view switched on: show the screen of whoever we drive.
+    view_on: bool,
+    viewing: Option<Viewing>,
+    serving: Option<Serving>,
+    /// Next time the watched side checks which output the cursor is on.
+    follow_next: Instant,
 }
 
 pub fn socket_path() -> PathBuf {
@@ -258,11 +301,23 @@ pub async fn run(cfg: Config) -> Result<()> {
         notifier,
         edge_push: None,
         ways_back,
+        psk,
+        net_tx: net_tx.clone(),
+        view_on: false,
+        viewing: None,
+        serving: None,
+        follow_next: Instant::now(),
     };
+    d.view_on = d.cfg.view.on;
 
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    // While streaming, also catch cursor jumps that came without pointer
+    // motion (a keybind focusing another monitor).
+    let mut follow = tokio::time::interval(FOLLOW_TICK);
+    follow.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
+            _ = follow.tick(), if d.serving.is_some() => d.follow_cursor().await,
             Some(ev) = dev_rx.recv() => d.on_device(ev).await,
             Some(ev) = net_rx.recv() => d.on_net(ev).await,
             Some(c) = ctl_rx.recv() => {
@@ -274,6 +329,7 @@ pub async fn run(cfg: Config) -> Result<()> {
         }
     }
     d.stop_control("shutting down", None).await;
+    d.serving = None;
     d.mirrors.clear();
     let _ = std::fs::remove_file(&sock);
     Ok(())
@@ -301,9 +357,15 @@ async fn connection(
         w.send(&Msg::Hello {
             name: me.clone(),
             version: PROTOCOL_VERSION,
+            video: None,
         })
         .await?;
-        let Msg::Hello { name, version } = r.recv().await? else {
+        let Msg::Hello {
+            name,
+            version,
+            video,
+        } = r.recv().await?
+        else {
             bail!("expected hello")
         };
         if version != PROTOCOL_VERSION {
@@ -315,19 +377,30 @@ async fn connection(
         if want.as_ref().is_some_and(|w| *w != name) {
             bail!("expected {:?}, got {name:?}", want.unwrap());
         }
-        Ok((r, w, name))
+        Ok((r, w, name, video))
     };
-    let (mut r, mut w, peer) = match tokio::time::timeout(Duration::from_secs(5), setup).await {
-        Ok(Ok(x)) => x,
-        Ok(Err(e)) => {
-            log::warn!("connection {from}: {e:#}");
-            return;
-        }
-        Err(_) => {
-            log::warn!("connection {from}: handshake timed out");
-            return;
-        }
-    };
+    let (mut r, mut w, peer, video) =
+        match tokio::time::timeout(Duration::from_secs(5), setup).await {
+            Ok(Ok(x)) => x,
+            Ok(Err(e)) => {
+                log::warn!("connection {from}: {e:#}");
+                return;
+            }
+            Err(_) => {
+                log::warn!("connection {from}: handshake timed out");
+                return;
+            }
+        };
+    if let Some(session) = video {
+        log::debug!("{peer}: video link for view {session:x}");
+        let _ = net.send(NetEvent::VideoLink {
+            peer,
+            session,
+            r,
+            w,
+        });
+        return;
+    }
     log::info!("connected to {peer} ({from})");
     let (tx, mut rx) = mpsc::unbounded_channel::<Msg>();
     if net
@@ -335,6 +408,7 @@ async fn connection(
             peer: peer.clone(),
             conn,
             tx,
+            initiator,
         })
         .is_err()
     {
@@ -592,16 +666,20 @@ impl Daemon {
             .map_err(|e| log::debug!("systemd-inhibit: {e}"))
             .ok();
         self.notifier
-            .driving(&peer, side.opposite(), &self.ways_back);
+            .driving(&peer, side.opposite(), &self.ways_back, self.view_on);
         self.controlling = Some(Controlling {
             peer,
             side,
             inhibit,
         });
+        if self.view_on {
+            self.begin_view();
+        }
     }
 
     /// Give local input back. `back_at`: where along our edge the cursor returns.
     async fn stop_control(&mut self, why: &str, back_at: Option<f64>) {
+        self.end_view();
         let Some(mut c) = self.controlling.take() else {
             return;
         };
@@ -636,7 +714,12 @@ impl Daemon {
 
     async fn on_net(&mut self, ev: NetEvent) {
         match ev {
-            NetEvent::Up { peer, conn, tx } => {
+            NetEvent::Up {
+                peer,
+                conn,
+                tx,
+                initiator,
+            } => {
                 if self.links.contains_key(&peer) {
                     log::info!("{peer}: replacing older connection");
                     self.peer_gone(&peer).await;
@@ -647,8 +730,22 @@ impl Daemon {
                         desc: d.desc.clone(),
                     });
                 }
-                self.links.insert(peer, Link { conn, tx });
+                self.links.insert(
+                    peer,
+                    Link {
+                        conn,
+                        tx,
+                        initiator,
+                    },
+                );
             }
+            NetEvent::VideoLink {
+                peer,
+                session,
+                r,
+                w,
+            } => self.on_video_link(&peer, session, r, w),
+            NetEvent::ViewEnded { session, why } => self.on_view_ended(session, &why),
             NetEvent::Down { peer, conn } => {
                 if self.links.get(&peer).is_some_and(|l| l.conn == conn) {
                     log::info!("{peer} disconnected");
@@ -670,6 +767,12 @@ impl Daemon {
         }
         if self.controlled_by.as_ref().is_some_and(|c| c.peer == peer) {
             self.controlled_by = None;
+        }
+        if self.viewing.as_ref().is_some_and(|v| v.peer == peer) {
+            self.viewing = None;
+        }
+        if self.serving.as_ref().is_some_and(|v| v.peer == peer) {
+            self.serving = None;
         }
         self.mirrors.retain(|(p, _), _| p != peer); // Drop lifts held keys
     }
@@ -735,6 +838,14 @@ impl Daemon {
                         return;
                     }
                 };
+                if pointer
+                    && (dx != 0.0 || dy != 0.0)
+                    && self.serving.is_some()
+                    && Instant::now() >= self.follow_next
+                {
+                    self.follow_next = Instant::now() + FOLLOW_EVERY;
+                    self.follow_cursor().await;
+                }
                 if pointer && side.pushed_by(dx, dy) && self.back_watch.due() {
                     self.check_return(peer, side).await;
                 }
@@ -744,6 +855,7 @@ impl Daemon {
                     log::info!("→ {peer} let go");
                     self.release_mirrors(peer);
                     self.controlled_by = None;
+                    self.serving = None;
                 }
             }
             Msg::Released { frac } => {
@@ -751,6 +863,29 @@ impl Daemon {
                     self.stop_control("cursor came back", Some(frac)).await;
                 }
             }
+            Msg::ViewToggle { on } => {
+                if self.controlling.as_ref().is_some_and(|c| c.peer == peer) {
+                    self.set_view(on);
+                }
+            }
+            Msg::ViewStart {
+                session,
+                fps,
+                kbps,
+                codec,
+            } => self.on_view_start(peer, session, fps, kbps, &codec).await,
+            Msg::ViewStop { session } => {
+                if self.serving.as_ref().is_some_and(|s| s.session == session) {
+                    log::info!("view: {peer} stopped watching");
+                    self.serving = None;
+                }
+            }
+            Msg::ViewFailed { session, why } => {
+                if self.viewing.as_ref().is_some_and(|v| v.session == session) {
+                    self.view_broke(&format!("{peer}: {why}"));
+                }
+            }
+            Msg::ViewData(_) => {}
         }
     }
 
@@ -769,6 +904,7 @@ impl Daemon {
             log::info!("→ handing back to {peer}");
             self.release_mirrors(peer);
             self.controlled_by = None;
+            self.serving = None;
             self.send(peer, Msg::Released { frac });
         }
     }
@@ -814,6 +950,7 @@ impl Daemon {
                 _ => 0.5,
             };
             log::info!("→ handing back to {} (switch)", cb.peer);
+            self.serving = None;
             self.release_mirrors(&cb.peer);
             self.send(&cb.peer, Msg::Released { frac });
             return Ok(());
@@ -846,6 +983,24 @@ impl Daemon {
             Some((v, a)) => (v, Some(a.trim()).filter(|a| !a.is_empty())),
             None => (cmd, None),
         };
+        if verb == "view" {
+            let on = match arg {
+                None | Some("toggle") => None,
+                Some("on") => Some(true),
+                Some("off") => Some(false),
+                Some(other) => {
+                    return format!("error: view takes on, off or toggle, not {other:?}\n");
+                }
+            };
+            if let Some(cb) = &self.controlled_by {
+                // Pressed on the driver's keyboard: remote view is its setting.
+                let peer = cb.peer.clone();
+                self.send(&peer, Msg::ViewToggle { on });
+                return format!("asked {peer} to switch remote view\n");
+            }
+            self.set_view(on);
+            return self.status();
+        }
         if verb == "switch" {
             if let Err(e) = self.switch(arg).await {
                 return format!("error: {e}\n");
@@ -866,7 +1021,7 @@ impl Daemon {
             }
             other => {
                 return format!(
-                    "unknown command {other:?} (status, switch [peer], toggle, enable, disable, release)\n"
+                    "unknown command {other:?} (status, switch [peer], view [on|off], toggle, enable, disable, release)\n"
                 );
             }
         }
@@ -878,6 +1033,230 @@ impl Daemon {
             self.stop_control("disabled", None).await;
         }
         self.status()
+    }
+
+    // ---------------------------------------------------------------- remote view
+
+    /// Flip (None) or set remote view; opens/closes it right away while driving.
+    fn set_view(&mut self, on: Option<bool>) {
+        let on = on.unwrap_or(!self.view_on);
+        self.view_on = on;
+        log::info!("remote view {}", if on { "on" } else { "off" });
+        let peer = self.controlling.as_ref().map(|c| c.peer.clone());
+        self.notifier
+            .view_switched(on, peer.as_deref(), self.cfg.view.hint.as_deref());
+        if on {
+            self.begin_view();
+        } else {
+            self.end_view();
+        }
+    }
+
+    /// Viewer: ask the machine we drive for its screen.
+    fn begin_view(&mut self) {
+        let Some(c) = &self.controlling else {
+            return;
+        };
+        if self.viewing.is_some() {
+            return;
+        }
+        let peer = c.peer.clone();
+        let session = view::session_id();
+        let v = &self.cfg.view;
+        log::info!(
+            "view: asking {peer} for its screen ({} fps, {} kb/s {})",
+            v.fps,
+            v.bitrate_kbps,
+            v.codec
+        );
+        self.send(
+            &peer,
+            Msg::ViewStart {
+                session,
+                fps: v.fps,
+                kbps: v.bitrate_kbps,
+                codec: v.codec.clone(),
+            },
+        );
+        self.viewing = Some(Viewing {
+            peer: peer.clone(),
+            session,
+            task: None,
+        });
+        self.dial_video(&peer, session);
+    }
+
+    fn end_view(&mut self) {
+        if let Some(v) = self.viewing.take() {
+            log::info!("view: closed {}", v.peer);
+            self.send(&v.peer, Msg::ViewStop { session: v.session });
+        }
+    }
+
+    /// The viewer's stream died on its own: say why, keep remote view on.
+    fn view_broke(&mut self, why: &str) {
+        let Some(v) = self.viewing.take() else {
+            return;
+        };
+        log::warn!("view: {why}");
+        self.send(&v.peer, Msg::ViewStop { session: v.session });
+        self.notifier.view_failed(&v.peer, why);
+    }
+
+    /// Whoever dialed the main link dials the video link too (the other side
+    /// may not accept connections at all).
+    fn dial_video(&self, peer: &str, session: u64) {
+        if !self.links.get(peer).is_some_and(|l| l.initiator) {
+            return; // the peer dials us
+        }
+        let Some(addr) = self
+            .cfg
+            .peers
+            .iter()
+            .find(|p| p.name == peer)
+            .and_then(|p| p.address.as_deref())
+            .map(crate::config::with_port)
+        else {
+            return;
+        };
+        let (net, psk, me, want) = (
+            self.net_tx.clone(),
+            self.psk,
+            self.cfg.name.clone(),
+            peer.to_string(),
+        );
+        tokio::spawn(async move {
+            let ev = match view::dial(&addr, psk, &me, &want, session).await {
+                Ok((r, w)) => NetEvent::VideoLink {
+                    peer: want,
+                    session,
+                    r,
+                    w,
+                },
+                Err(e) => NetEvent::ViewEnded {
+                    session,
+                    why: format!("video link to {want}: {e:#}"),
+                },
+            };
+            let _ = net.send(ev);
+        });
+    }
+
+    /// Watched: the machine driving us wants to see our screen.
+    async fn on_view_start(&mut self, peer: &str, session: u64, fps: u32, kbps: u32, codec: &str) {
+        if !self.controlled_by.as_ref().is_some_and(|c| c.peer == peer) {
+            self.send(
+                peer,
+                Msg::ViewFailed {
+                    session,
+                    why: "not being driven from there".into(),
+                },
+            );
+            return;
+        }
+        if !crate::config::valid_codec(codec) {
+            self.send(
+                peer,
+                Msg::ViewFailed {
+                    session,
+                    why: format!("unknown codec {codec:?}"),
+                },
+            );
+            return;
+        }
+        let monitor = self.monitor_under_cursor().await.unwrap_or_default();
+        let capture = crate::config::fill(
+            &self.cfg.view.capture,
+            &[
+                ("fps", &fps.to_string()),
+                ("kbps", &kbps.to_string()),
+                ("codec", codec),
+            ],
+        );
+        log::info!("view: {peer} is watching (starting on {monitor})");
+        let (tx, _) = watch::channel(monitor);
+        self.serving = Some(Serving {
+            peer: peer.to_string(),
+            session,
+            capture,
+            monitor: tx,
+            task: None,
+        });
+        self.follow_next = Instant::now() + FOLLOW_EVERY;
+        self.dial_video(peer, session);
+    }
+
+    async fn monitor_under_cursor(&mut self) -> Option<String> {
+        let (x, y) = self.hypr.cursor().await.ok()?;
+        let layout = self.hypr.layout().await.ok()?;
+        layout
+            .monitor_at(x, y)
+            .or(layout.names.first().map(String::as_str))
+            .map(String::from)
+    }
+
+    /// Watched: switch the stream to the output the cursor moved onto.
+    async fn follow_cursor(&mut self) {
+        let Some(now) = self.monitor_under_cursor().await else {
+            return;
+        };
+        if let Some(sv) = &self.serving
+            && *sv.monitor.borrow() != now
+        {
+            log::debug!("view: cursor moved to {now}");
+            sv.monitor.send_replace(now);
+        }
+    }
+
+    fn on_video_link(&mut self, peer: &str, session: u64, r: proto::Reader, w: proto::Writer) {
+        let ended = move |net: mpsc::UnboundedSender<NetEvent>, res: anyhow::Result<()>| {
+            let why = match res {
+                Ok(()) => "the stream ended".to_string(),
+                Err(e) => format!("{e:#}"),
+            };
+            let _ = net.send(NetEvent::ViewEnded { session, why });
+        };
+        let net = self.net_tx.clone();
+        if let Some(v) = self
+            .viewing
+            .as_mut()
+            .filter(|v| v.peer == peer && v.session == session && v.task.is_none())
+        {
+            let player = crate::config::fill(
+                &self.cfg.view.player,
+                &[("codec", &self.cfg.view.codec), ("peer", peer)],
+            );
+            log::info!("view: showing {peer}");
+            v.task = Some(Task::spawn(async move {
+                ended(net, view::watch(r, w, player).await);
+            }));
+        } else if let Some(sv) = self
+            .serving
+            .as_mut()
+            .filter(|s| s.peer == peer && s.session == session && s.task.is_none())
+        {
+            let (capture, monitor) = (sv.capture.clone(), sv.monitor.subscribe());
+            sv.task = Some(Task::spawn(async move {
+                ended(net, view::serve(w, r, capture, monitor).await);
+            }));
+        } else {
+            log::debug!("{peer}: video link for unknown view {session:x}, dropped");
+        }
+    }
+
+    fn on_view_ended(&mut self, session: u64, why: &str) {
+        if self.viewing.as_ref().is_some_and(|v| v.session == session) {
+            self.view_broke(why);
+        } else if let Some(sv) = self.serving.take_if(|s| s.session == session) {
+            log::warn!("view: streaming to {} stopped: {why}", sv.peer);
+            self.send(
+                &sv.peer,
+                Msg::ViewFailed {
+                    session,
+                    why: why.to_string(),
+                },
+            );
+        }
     }
 
     fn status(&self) -> String {
@@ -901,6 +1280,22 @@ impl Daemon {
             _ => "local".to_string(),
         };
         s += &format!("state: {mode}\n");
+        s += &format!("remote view: {}", if self.view_on { "on" } else { "off" });
+        if let Some(v) = &self.viewing {
+            s += &format!(
+                " (watching {}{})",
+                v.peer,
+                if v.task.is_some() { "" } else { ", connecting" }
+            );
+        }
+        if let Some(sv) = &self.serving {
+            s += &format!(
+                ", streaming {} to {}",
+                sv.monitor.borrow().as_str(),
+                sv.peer
+            );
+        }
+        s += "\n";
         let mut names: Vec<&str> = self
             .devices
             .values()
@@ -947,6 +1342,7 @@ mod tests {
             switch_hint: None,
             ignore_devices: vec![],
             peers: vec![],
+            view: Default::default(),
         }
         .psk_bytes()
         .unwrap();
@@ -960,6 +1356,7 @@ mod tests {
         w.send(&Msg::Hello {
             name: "probe".into(),
             version: PROTOCOL_VERSION,
+            video: None,
         })
         .await
         .unwrap();
@@ -1042,6 +1439,7 @@ mod tests {
             switch_hint: None,
             ignore_devices: vec![],
             peers: vec![],
+            view: Default::default(),
         }
         .psk_bytes()
         .unwrap();
@@ -1056,6 +1454,7 @@ mod tests {
         w.send(&Msg::Hello {
             name: "probe".into(),
             version: PROTOCOL_VERSION,
+            video: None,
         })
         .await
         .unwrap();

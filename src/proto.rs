@@ -12,7 +12,7 @@ use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 
 use crate::geometry::Side;
 
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 const NOISE_PARAMS: &str = "Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s";
 const MAX_FRAME: usize = 65535;
 /// Keep plaintext well under the Noise limit (65535 incl. 16-byte tag).
@@ -59,6 +59,9 @@ pub enum Msg {
     Hello {
         name: String,
         version: u32,
+        /// Some(session): this connection only carries remote-view video for
+        /// that session (main links say None).
+        video: Option<u64>,
     },
     Ping,
     // controller → receiver
@@ -85,6 +88,30 @@ pub enum Msg {
     Released {
         frac: f64,
     },
+    // remote view
+    /// Receiver → controller: the view key was pressed (on the controller's
+    /// keyboard, so it reached the receiver's compositor). Flip remote view
+    /// (None) or set it.
+    ViewToggle {
+        on: Option<bool>,
+    },
+    /// Viewer → watched: stream the screen under your cursor for `session`.
+    ViewStart {
+        session: u64,
+        fps: u32,
+        kbps: u32,
+        codec: String,
+    },
+    ViewStop {
+        session: u64,
+    },
+    /// Watched → viewer: the stream for `session` broke (`why` is for people).
+    ViewFailed {
+        session: u64,
+        why: String,
+    },
+    /// Video link only: the next piece of the encoded stream.
+    ViewData(Vec<u8>),
 }
 
 fn noise_builder(psk: &[u8; 32]) -> Result<snow::Builder<'_>> {
@@ -214,8 +241,10 @@ mod tests {
         let server = tokio::spawn(async move {
             let (s, _) = l.accept().await.unwrap();
             let (mut r, mut w) = handshake(s, &psk, false).await.unwrap();
-            let m = r.recv().await.unwrap();
-            w.send(&m).await.unwrap();
+            for _ in 0..2 {
+                let m = r.recv().await.unwrap();
+                w.send(&m).await.unwrap();
+            }
         });
         let s = TcpStream::connect(addr).await.unwrap();
         let (mut r, mut w) = handshake(s, &psk, true).await.unwrap();
@@ -225,6 +254,9 @@ mod tests {
         };
         w.send(&msg).await.unwrap();
         assert_eq!(r.recv().await.unwrap(), msg);
+        let big = Msg::ViewData(vec![0xab; MAX_PAYLOAD - 16]);
+        w.send(&big).await.unwrap();
+        assert_eq!(r.recv().await.unwrap(), big);
         server.await.unwrap();
     }
 

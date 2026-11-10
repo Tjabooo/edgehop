@@ -37,6 +37,104 @@ pub struct Config {
     pub ignore_devices: Vec<String>,
     #[serde(default)]
     pub peers: Vec<PeerConfig>,
+    /// Remote view: watch the screen of the machine you're driving.
+    #[serde(default)]
+    pub view: ViewConfig,
+}
+
+/// `[view]`: see a peer's screen here while you drive it.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ViewConfig {
+    /// Start with remote view switched on (else `edgehop view` turns it on).
+    pub on: bool,
+    /// What you ask the other machine for when watching it.
+    pub fps: u32,
+    pub bitrate_kbps: u32,
+    /// "h264" or "hevc".
+    pub codec: String,
+    /// Your `edgehop view` keybind, named in the notifications.
+    pub hint: Option<String>,
+    /// Command printing a raw Annex-B stream of one output to stdout.
+    /// Placeholders: {monitor} {fps} {kbps} {codec}.
+    pub capture: Vec<String>,
+    /// Command showing that stream (read from stdin) full screen.
+    /// Placeholders: {codec} {peer}.
+    pub player: Vec<String>,
+}
+
+impl Default for ViewConfig {
+    fn default() -> ViewConfig {
+        let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        ViewConfig {
+            on: false,
+            fps: 60,
+            bitrate_kbps: 20000,
+            codec: "h264".into(),
+            hint: None,
+            capture: v(&[
+                "gpu-screen-recorder",
+                "-w",
+                "{monitor}",
+                "-f",
+                "{fps}",
+                "-k",
+                "{codec}",
+                "-bm",
+                "cbr",
+                "-q",
+                "{kbps}",
+                "-tune",
+                "performance",
+                "-c",
+                "{codec}",
+                "-o",
+                "/dev/stdout",
+            ]),
+            player: v(&[
+                "mpv",
+                "--no-config",
+                "--really-quiet",
+                "--profile=low-latency",
+                "--untimed",
+                "--cache=no",
+                "--demuxer-lavf-format={codec}",
+                "--demuxer-lavf-probesize=32",
+                "--demuxer-lavf-analyzeduration=0",
+                "--hwdec=auto",
+                "--no-audio",
+                "--fs",
+                "--no-border",
+                "--wayland-app-id=edgehop-view",
+                "--title=edgehop: {peer}",
+                "--cursor-autohide=always",
+                "--no-osc",
+                "--osd-level=0",
+                "--no-input-default-bindings",
+                "--input-vo-keyboard=no",
+                "--background-color=#000000",
+                "-",
+            ]),
+        }
+    }
+}
+
+/// Fill `{name}` placeholders in a command template.
+pub fn fill(template: &[String], vars: &[(&str, &str)]) -> Vec<String> {
+    template
+        .iter()
+        .map(|arg| {
+            let mut a = arg.clone();
+            for (k, v) in vars {
+                a = a.replace(&format!("{{{k}}}"), v);
+            }
+            a
+        })
+        .collect()
+}
+
+pub fn valid_codec(c: &str) -> bool {
+    matches!(c, "h264" | "hevc")
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -77,6 +175,15 @@ impl Config {
             toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
         cfg.psk_bytes()?;
         cfg.release_codes()?;
+        if !valid_codec(&cfg.view.codec) {
+            bail!(
+                "view.codec must be \"h264\" or \"hevc\", not {:?}",
+                cfg.view.codec
+            );
+        }
+        if cfg.view.capture.is_empty() || cfg.view.player.is_empty() {
+            bail!("view.capture and view.player can't be empty");
+        }
         let mut sides = Vec::new();
         for p in &cfg.peers {
             if p.name == cfg.name {
@@ -157,5 +264,28 @@ mod tests {
         let cfg: Config = toml::from_str(text).unwrap();
         assert_eq!(cfg.peers.len(), 1);
         assert!(cfg.release_codes().is_ok());
+        assert!(cfg.view.on);
+        assert_eq!(cfg.view.capture[0], "gpu-screen-recorder");
+    }
+
+    #[test]
+    fn view_defaults_and_fill() {
+        let cfg: Config = toml::from_str("name = \"a\"\npsk = \"x\"\n").unwrap();
+        assert!(!cfg.view.on);
+        let cmd = fill(
+            &cfg.view.capture,
+            &[
+                ("monitor", "DP-3"),
+                ("fps", "60"),
+                ("kbps", "9000"),
+                ("codec", "hevc"),
+            ],
+        );
+        assert!(cmd.windows(2).any(|w| w == ["-w", "DP-3"]));
+        assert!(cmd.windows(2).any(|w| w == ["-q", "9000"]));
+        assert!(cmd.windows(2).any(|w| w == ["-c", "hevc"]));
+        let play = fill(&cfg.view.player, &[("codec", "hevc"), ("peer", "magi")]);
+        assert!(play.contains(&"--demuxer-lavf-format=hevc".to_string()));
+        assert!(play.contains(&"--title=edgehop: magi".to_string()));
     }
 }

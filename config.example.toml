@@ -27,6 +27,24 @@ notify = true
 # Devices never captured (case-insensitive substring of the device name).
 ignore_devices = []
 
+# Remote view: while you drive another machine, see its screen here, full
+# screen, following the cursor from monitor to monitor. `edgehop view` (bind it
+# to a key on every machine) switches it on/off; once on, it opens each time you
+# cross over and closes when you come back. Needs gpu-screen-recorder on the
+# machine being watched and mpv on the one watching.
+[view]
+on = true
+# What you ask for when watching (the other machine encodes it).
+fps = 60
+bitrate_kbps = 20000
+codec = "h264"            # or "hevc"
+# hint = "Super+Alt+L"    # your `edgehop view` keybind, named in notifications
+# Override the commands if you like. capture prints a raw Annex-B stream of
+# {monitor} to stdout ({fps} {kbps} {codec}); player shows stdin ({codec} {peer}).
+# capture = ["gpu-screen-recorder", "-w", "{monitor}", "-f", "{fps}", "-k", "{codec}",
+#            "-bm", "cbr", "-q", "{kbps}", "-tune", "performance", "-c", "{codec}", "-o", "/dev/stdout"]
+# player = ["mpv", "--profile=low-latency", "--untimed", "--demuxer-lavf-format={codec}", "--fs", "-"]
+
 # One block per neighbouring machine.
 [[peers]]
 name = "desktop"

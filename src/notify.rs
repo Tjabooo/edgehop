@@ -105,9 +105,15 @@ pub fn ways_back(release_keys: &[String], switch_hint: Option<&str>) -> String {
 
 impl Notifier {
     /// Controller side: shown (and kept) while this machine's input drives `peer`.
-    pub fn driving(&self, peer: &str, peer_edge: Side, ways: &str) {
+    /// With remote view on, the stream covers the screen, so the note is brief.
+    pub fn driving(&self, peer: &str, peer_edge: Side, ways: &str, viewing: bool) {
         let body = format!(
-            "Your keyboard and mouse are on {peer}.\nCome back: push the cursor off {peer}'s {}, {ways}.",
+            "Your keyboard and mouse are on {peer}{}.\nCome back: push the cursor off {peer}'s {}, {ways}.",
+            if viewing {
+                ", and its screen is shown here"
+            } else {
+                ""
+            },
             edge_word(peer_edge)
         );
         let args = vec![
@@ -115,7 +121,7 @@ impl Notifier {
             "edgehop".into(),
             "-p".into(),
             "-t".into(),
-            "0".into(),
+            if viewing { "4000" } else { "0" }.into(),
             "-h".into(),
             "string:x-dunst-stack-tag:edgehop".into(),
             format!("Driving {peer}"),
@@ -160,6 +166,49 @@ impl Notifier {
             body,
         ];
         self.spawn(args, false);
+    }
+}
+
+impl Notifier {
+    fn brief(&self, title: String, body: String, ms: u32) {
+        self.spawn(
+            vec![
+                "-a".into(),
+                "edgehop".into(),
+                "-t".into(),
+                ms.to_string(),
+                "-h".into(),
+                "string:x-dunst-stack-tag:edgehop-view".into(),
+                title,
+                body,
+            ],
+            false,
+        );
+    }
+
+    /// Remote view was switched on or off (`driving`: the peer we drive now).
+    pub fn view_switched(&self, on: bool, driving: Option<&str>, hint: Option<&str>) {
+        let again = hint
+            .map(|h| format!(" {h} again turns it off."))
+            .unwrap_or_default();
+        let (title, body) = match (on, driving) {
+            (true, Some(p)) => (
+                "Remote view on".to_string(),
+                format!(
+                    "Showing {p}'s screen here. It follows the cursor across {p}'s monitors.{again}"
+                ),
+            ),
+            (true, None) => (
+                "Remote view on".to_string(),
+                format!("When you cross over, the other machine's screen shows here.{again}"),
+            ),
+            (false, _) => ("Remote view off".to_string(), String::new()),
+        };
+        self.brief(title, body, 3000);
+    }
+
+    pub fn view_failed(&self, peer: &str, why: &str) {
+        self.brief(format!("Can't show {peer}'s screen"), why.to_string(), 6000);
     }
 }
 

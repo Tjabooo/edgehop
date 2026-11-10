@@ -20,6 +20,7 @@ edgehop links two (or more) Linux machines running Hyprland. Move the pointer of
   - Power, sleep and suspend keys are never forwarded.
   - No crossing while a fullscreen window (a game) is focused.
 - **Always know the way home.** While your input is away, a persistent notification says where it is and how to come back. The machine it arrives at shows a short hint too.
+- **Remote view.** Driving a machine that isn't in front of you? Press a key and its screen shows full screen on the one you're at, following the cursor from monitor to monitor. Once on, it opens every time you cross over and closes when you come back. The video uses its own encrypted link, so it never delays your input.
 - **Keybind switching.** `edgehop switch` jumps over without the edge, and the same bind brings you back.
 - **No idle lock while away.** While you drive another machine, the local one holds a systemd idle inhibitor, so hypridle doesn't lock or suspend it under you.
 - **Hotplug.** Devices plugged in later are picked up within a couple of seconds.
@@ -29,6 +30,7 @@ edgehop links two (or more) Linux machines running Hyprland. Move the pointer of
 - Linux with Hyprland (it uses Hyprland's IPC to read the cursor position and screen layout, and to place the cursor). Tested on Hyprland 0.57 (Lua config); older Hyprland versions fall back to the classic `movecursor` dispatcher (untested).
 - Read access to `/dev/input/event*` and write access to `/dev/uinput` for your user (see [Permissions](#permissions)).
 - Rust 1.88+ to build.
+- For remote view: [gpu-screen-recorder](https://git.dec05eba.com/gpu-screen-recorder/about/) on the machine being watched and [mpv](https://mpv.io) on the one watching (or your own commands, see [Remote view](#remote-view)).
 
 ## Install
 
@@ -104,11 +106,36 @@ hl.bind("SUPER + ALT + K", hl.dsp.exec_cmd(os.getenv("HOME") .. "/.local/bin/edg
 bind = SUPER ALT, K, exec, ~/.local/bin/edgehop switch
 ```
 
+Bind `edgehop view` too, on every machine, to switch [remote view](#remote-view) on and off. While you drive another machine your keys land there, so its bind passes the toggle back to yours:
+
+```lua
+hl.bind("SUPER + ALT + L", hl.dsp.exec_cmd(os.getenv("HOME") .. "/.local/bin/edgehop view"))
+```
+
 Mirrored devices appear on the far machine as `edgehop <original name>` (Hyprland: `edgehop-<name>`), so you can give them their own settings. For example, a laptop touchpad on a desktop that uses a flat mouse profile:
 
 ```lua
 hl.device({ name = "edgehop-asup1207:00-093a:3012-touchpad", sensitivity = 0.2, accel_profile = "adaptive" })
 ```
+
+### Remote view
+
+When you drive a machine whose screens you can't see (a desktop in another room, from a laptop), `edgehop view` shows its screen on the machine you're at:
+
+- It streams the monitor the cursor is on, full screen. Move the cursor to another monitor and the view switches to it (about 0.15 s).
+- The setting stays on: every crossing opens the view, coming back closes it. `edgehop view` (or `view on` / `view off`) changes it, also while you're over there.
+- The watched machine encodes with `gpu-screen-recorder` (hardware H.264/HEVC, cursor included) and sends a raw stream over a second Noise link, dialed the same way as the main one. The viewer pipes it into `mpv` tuned for low latency (`--untimed`, no cache).
+
+```toml
+[view]
+on = false          # start with remote view on
+fps = 60
+bitrate_kbps = 20000
+codec = "h264"      # or "hevc"
+hint = "Super+Alt+L"  # named in the notifications
+```
+
+`capture` and `player` override the commands; see `config.example.toml` for the placeholders. A stream that breaks (recorder missing, monitor gone) shows a notification saying why, and remote view stays on for the next crossing.
 
 ## Usage
 
@@ -117,6 +144,7 @@ edgehop run [--config FILE] [-v]   run the daemon (the systemd unit does this)
 edgehop check                      devices, permissions, screen layout
 edgehop status                     what the running daemon is doing
 edgehop switch [PEER]              jump to a peer now (or back home)
+edgehop view [on|off]              remote view: see the screen of the machine you drive
 edgehop toggle | enable | disable  switch edge crossing on/off
 edgehop release                    take local input back right now
 edgehop keygen                     print a fresh key for `psk`
@@ -145,12 +173,15 @@ Membership in `input` lets a program read every keystroke, which is also exactly
 3. **Drive.** Raw evdev events stream over the encrypted link. The peer replays them into its uinput copies of your devices, so its own libinput and Hyprland process them like local hardware.
 4. **Return.** The peer watches its cursor. When it is pushed out through the edge facing you, it lifts every held key and touch and sends `Released(position)`. You ungrab, and your cursor appears at the same spot on your edge.
 
+5. **Watch (remote view).** The driver sends `ViewStart`. The driven machine records the monitor under its cursor and streams it over its own encrypted link. Each time the cursor lands on another monitor it restarts the recorder there, and the player carries on with the new stream.
+
 Devices are announced when the link comes up (and on hotplug), so the copies already exist and are configured by the time you cross.
 
 ## Limitations
 
 - Hyprland only for now: the cursor and layout queries go through its IPC. Capture and injection are compositor-independent, so other compositors need only a small adapter.
 - Clipboard sharing isn't built in.
+- Remote view is video only (no sound) and needs both machines on the same protocol version (0.2+).
 - A fullscreen game that locks the pointer can't be left through the edge; use the release keys or the `switch` bind.
 
 ## License

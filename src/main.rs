@@ -6,6 +6,7 @@ mod hypr;
 mod mirror;
 mod notify;
 mod proto;
+mod view;
 
 use std::path::PathBuf;
 
@@ -20,6 +21,7 @@ usage:
   edgehop keygen                     print a fresh shared key for `psk`
   edgehop status                     what the running daemon is doing
   edgehop switch [PEER]              jump to a peer now (or back home); bind it to a key
+  edgehop view [on|off]              remote view: see the screen of the machine you drive; bind it to a key
   edgehop toggle | enable | disable  switch edge crossing on/off
   edgehop release                    take local input back right now
 
@@ -77,7 +79,7 @@ fn main() -> Result<()> {
         "status" | "toggle" | "enable" | "disable" | "on" | "off" | "release" => {
             rt.block_on(control(cmd))
         }
-        "switch" => rt.block_on(control(&args.join(" "))),
+        "switch" | "view" => rt.block_on(control(&args.join(" "))),
         _ => {
             eprintln!("{USAGE}");
             bail!("unknown command {cmd:?}")
