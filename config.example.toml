@@ -1,0 +1,31 @@
+# edgehop config: ~/.config/edgehop/config.toml
+# The same file shape on every machine; only `name` and `peers` differ.
+
+# This machine's name. Peers list it under exactly this name.
+name = "laptop"
+
+# Accept peers on this address (port defaults to 24801). Leave it out on a
+# machine that only dials out, e.g. one behind a firewall.
+listen = "0.0.0.0:24801"
+
+# Shared secret, identical on every machine. Make one with `edgehop keygen`.
+# Anyone holding it can type on your machines: keep the file private (chmod 600).
+psk = "REPLACE-WITH-OUTPUT-OF-edgehop-keygen-AAAAAAA="
+
+# Hold these together while driving another machine to snap back home.
+release_keys = ["KEY_LEFTCTRL", "KEY_LEFTALT", "KEY_ESC"]
+
+# Don't cross over while the focused window is fullscreen (games).
+block_when_fullscreen = true
+
+# Devices never captured (case-insensitive substring of the device name).
+ignore_devices = []
+
+# One block per neighbouring machine.
+[[peers]]
+name = "desktop"
+# Where its screens are, seen from here: left, right, top or bottom.
+side = "left"
+# Dial it here. Leave `address` out if that machine dials this one instead
+# (one side dialing is enough; the link carries both directions).
+# address = "192.168.1.20:24801"

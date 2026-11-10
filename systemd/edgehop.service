@@ -1,0 +1,12 @@
+[Unit]
+Description=edgehop software KVM (share keyboard and mouse across screen edges)
+Documentation=https://github.com/Tjabooo/edgehop
+After=graphical-session.target network-online.target
+
+[Service]
+ExecStart=%h/.local/bin/edgehop run
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,943 @@
+//! The state machine: watch the cursor, hand input over at screen edges,
+//! replay input from peers, hand it back.
+
+use std::collections::{BTreeSet, HashMap};
+use std::os::fd::OwnedFd;
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
+
+use anyhow::{Context, Result, bail};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::{TcpListener, TcpStream, UnixListener};
+use tokio::sync::{mpsc, oneshot};
+
+use crate::config::Config;
+use crate::devices::{self, DevEvent, InputState};
+use crate::geometry::Side;
+use crate::hypr::Hypr;
+use crate::mirror::Mirror;
+use crate::proto::{self, DeviceDesc, Ev, Msg, PROTOCOL_VERSION};
+
+const PING_EVERY: Duration = Duration::from_secs(1);
+const DEAD_AFTER: Duration = Duration::from_secs(4);
+const REDIAL_EVERY: Duration = Duration::from_secs(2);
+
+enum NetEvent {
+    Up {
+        peer: String,
+        conn: u64,
+        tx: mpsc::UnboundedSender<Msg>,
+    },
+    Msg {
+        peer: String,
+        conn: u64,
+        msg: Msg,
+    },
+    Down {
+        peer: String,
+        conn: u64,
+    },
+}
+
+struct Control {
+    cmd: String,
+    reply: oneshot::Sender<String>,
+}
+
+struct LocalDev {
+    desc: DeviceDesc,
+    grab_fd: OwnedFd,
+    state: InputState,
+    path: PathBuf,
+}
+
+struct Link {
+    conn: u64,
+    tx: mpsc::UnboundedSender<Msg>,
+}
+
+/// Rate-limits cursor queries: often near an edge, rarely far from it.
+struct EdgeWatch {
+    next: Instant,
+}
+
+impl EdgeWatch {
+    fn new() -> EdgeWatch {
+        EdgeWatch {
+            next: Instant::now(),
+        }
+    }
+    fn due(&self) -> bool {
+        Instant::now() >= self.next
+    }
+    fn after_query(&mut self, distance: f64) {
+        let wait = if distance < 48.0 {
+            2
+        } else if distance < 400.0 {
+            8
+        } else {
+            30
+        };
+        self.next = Instant::now() + Duration::from_millis(wait);
+    }
+}
+
+struct Controlling {
+    peer: String,
+    side: Side,
+    /// Keeps hypridle from locking/suspending this machine while its own
+    /// input is grabbed (it sees no activity).
+    inhibit: Option<tokio::process::Child>,
+}
+
+struct ControlledBy {
+    peer: String,
+    side: Side,
+}
+
+struct Daemon {
+    cfg: Config,
+    release_codes: Vec<u16>,
+    hypr: Hypr,
+    devices: HashMap<u32, LocalDev>,
+    links: HashMap<String, Link>,
+    mirrors: HashMap<(String, u32), Mirror>,
+    controlling: Option<Controlling>,
+    controlled_by: Option<ControlledBy>,
+    enabled: bool,
+    out_watch: EdgeWatch,
+    back_watch: EdgeWatch,
+    /// `edgehop switch` waits for the keybind's keys to be let go first,
+    /// else this machine's compositor would never see them released.
+    pending_switch: Option<(String, Side, Instant)>,
+}
+
+pub fn socket_path() -> PathBuf {
+    if let Some(p) = std::env::var_os("EDGEHOP_SOCKET") {
+        return PathBuf::from(p);
+    }
+    let base = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(format!("/run/user/{}", unsafe { libc::getuid() })));
+    base.join("edgehop.sock")
+}
+
+pub async fn run(cfg: Config) -> Result<()> {
+    let psk = cfg.psk_bytes()?;
+    let (dev_tx, mut dev_rx) = mpsc::channel::<DevEvent>(1024);
+    let (net_tx, mut net_rx) = mpsc::unbounded_channel::<NetEvent>();
+    let (ctl_tx, mut ctl_rx) = mpsc::channel::<Control>(8);
+
+    tokio::spawn(devices::manager(cfg.ignore_devices.clone(), dev_tx));
+
+    let peer_names: Vec<String> = cfg.peers.iter().map(|p| p.name.clone()).collect();
+    if let Some(addr) = cfg.listen.as_deref().map(crate::config::with_port) {
+        let addr = &addr;
+        let listener = TcpListener::bind(addr)
+            .await
+            .with_context(|| format!("listen on {addr}"))?;
+        log::info!("listening on {addr}");
+        let (net_tx, names, me) = (net_tx.clone(), peer_names.clone(), cfg.name.clone());
+        tokio::spawn(async move {
+            loop {
+                match listener.accept().await {
+                    Ok((s, from)) => {
+                        log::debug!("connection from {from}");
+                        tokio::spawn(connection(
+                            s,
+                            psk,
+                            false,
+                            me.clone(),
+                            names.clone(),
+                            None,
+                            net_tx.clone(),
+                        ));
+                    }
+                    Err(e) => {
+                        log::warn!("accept: {e}");
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                    }
+                }
+            }
+        });
+    }
+    for p in &cfg.peers {
+        let Some(addr) = p.address.as_deref().map(crate::config::with_port) else {
+            continue;
+        };
+        let (net_tx, names, me, want) = (
+            net_tx.clone(),
+            peer_names.clone(),
+            cfg.name.clone(),
+            p.name.clone(),
+        );
+        tokio::spawn(async move {
+            let mut last_err = String::new();
+            loop {
+                match tokio::time::timeout(Duration::from_secs(3), TcpStream::connect(&addr)).await
+                {
+                    Ok(Ok(s)) => {
+                        last_err.clear();
+                        connection(
+                            s,
+                            psk,
+                            true,
+                            me.clone(),
+                            names.clone(),
+                            Some(want.clone()),
+                            net_tx.clone(),
+                        )
+                        .await;
+                    }
+                    Ok(Err(e)) => {
+                        let e = e.to_string();
+                        if e != last_err {
+                            log::info!("dial {want} at {addr}: {e} (retrying)");
+                            last_err = e;
+                        }
+                    }
+                    Err(_) => {
+                        if last_err != "timeout" {
+                            log::info!("dial {want} at {addr}: timed out (retrying)");
+                            last_err = "timeout".into();
+                        }
+                    }
+                }
+                tokio::time::sleep(REDIAL_EVERY).await;
+            }
+        });
+    }
+
+    let sock = socket_path();
+    let _ = std::fs::remove_file(&sock);
+    let ctl = UnixListener::bind(&sock).with_context(|| format!("bind {}", sock.display()))?;
+    tokio::spawn(async move {
+        while let Ok((s, _)) = ctl.accept().await {
+            let ctl_tx = ctl_tx.clone();
+            tokio::spawn(async move {
+                let (r, mut w) = s.into_split();
+                let mut line = String::new();
+                if BufReader::new(r).read_line(&mut line).await.is_err() {
+                    return;
+                }
+                let (reply, rx) = oneshot::channel();
+                if ctl_tx
+                    .send(Control {
+                        cmd: line.trim().to_string(),
+                        reply,
+                    })
+                    .await
+                    .is_ok()
+                    && let Ok(text) = rx.await
+                {
+                    let _ = w.write_all(text.as_bytes()).await;
+                }
+            });
+        }
+    });
+
+    let mut d = Daemon {
+        release_codes: cfg.release_codes()?,
+        cfg,
+        hypr: Hypr::new(),
+        devices: HashMap::new(),
+        links: HashMap::new(),
+        mirrors: HashMap::new(),
+        controlling: None,
+        controlled_by: None,
+        enabled: true,
+        out_watch: EdgeWatch::new(),
+        back_watch: EdgeWatch::new(),
+        pending_switch: None,
+    };
+
+    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    loop {
+        tokio::select! {
+            Some(ev) = dev_rx.recv() => d.on_device(ev).await,
+            Some(ev) = net_rx.recv() => d.on_net(ev).await,
+            Some(c) = ctl_rx.recv() => {
+                let text = d.on_control(&c.cmd).await;
+                let _ = c.reply.send(text);
+            }
+            _ = tokio::signal::ctrl_c() => break,
+            _ = term.recv() => break,
+        }
+    }
+    d.stop_control("shutting down", None).await;
+    d.mirrors.clear();
+    let _ = std::fs::remove_file(&sock);
+    Ok(())
+}
+
+/// One authenticated connection to a peer: handshake, hello, then pump
+/// messages both ways until it dies.
+async fn connection(
+    stream: TcpStream,
+    psk: [u8; 32],
+    initiator: bool,
+    me: String,
+    peers: Vec<String>,
+    want: Option<String>,
+    net: mpsc::UnboundedSender<NetEvent>,
+) {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let conn = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let from = stream
+        .peer_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_default();
+    let setup = async {
+        let (mut r, mut w) = proto::handshake(stream, &psk, initiator).await?;
+        w.send(&Msg::Hello {
+            name: me.clone(),
+            version: PROTOCOL_VERSION,
+        })
+        .await?;
+        let Msg::Hello { name, version } = r.recv().await? else {
+            bail!("expected hello")
+        };
+        if version != PROTOCOL_VERSION {
+            bail!("{name} speaks protocol {version}, this is {PROTOCOL_VERSION}: update both");
+        }
+        if !peers.contains(&name) {
+            bail!("{name:?} is not in this machine's peers");
+        }
+        if want.as_ref().is_some_and(|w| *w != name) {
+            bail!("expected {:?}, got {name:?}", want.unwrap());
+        }
+        Ok((r, w, name))
+    };
+    let (mut r, mut w, peer) = match tokio::time::timeout(Duration::from_secs(5), setup).await {
+        Ok(Ok(x)) => x,
+        Ok(Err(e)) => {
+            log::warn!("connection {from}: {e:#}");
+            return;
+        }
+        Err(_) => {
+            log::warn!("connection {from}: handshake timed out");
+            return;
+        }
+    };
+    log::info!("connected to {peer} ({from})");
+    let (tx, mut rx) = mpsc::unbounded_channel::<Msg>();
+    if net
+        .send(NetEvent::Up {
+            peer: peer.clone(),
+            conn,
+            tx,
+        })
+        .is_err()
+    {
+        return;
+    }
+    let writer = tokio::spawn(async move {
+        let mut tick = tokio::time::interval(PING_EVERY);
+        loop {
+            let msg = tokio::select! {
+                m = rx.recv() => match m { Some(m) => m, None => return },
+                _ = tick.tick() => Msg::Ping,
+            };
+            if let Err(e) = w.send(&msg).await {
+                log::debug!("send: {e}");
+                return;
+            }
+        }
+    });
+    loop {
+        match tokio::time::timeout(DEAD_AFTER, r.recv()).await {
+            Ok(Ok(Msg::Ping)) => {}
+            Ok(Ok(msg)) => {
+                if net
+                    .send(NetEvent::Msg {
+                        peer: peer.clone(),
+                        conn,
+                        msg,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            Ok(Err(e)) => {
+                log::info!("{peer}: connection closed ({e:#})");
+                break;
+            }
+            Err(_) => {
+                log::info!("{peer}: no answer for {}s, dropping", DEAD_AFTER.as_secs());
+                break;
+            }
+        }
+        if writer.is_finished() {
+            break;
+        }
+    }
+    writer.abort();
+    let _ = net.send(NetEvent::Down { peer, conn });
+}
+
+impl Daemon {
+    fn send(&self, peer: &str, msg: Msg) {
+        if let Some(l) = self.links.get(peer) {
+            let _ = l.tx.send(msg);
+        }
+    }
+
+    // ---------------------------------------------------------------- local input
+
+    async fn on_device(&mut self, ev: DevEvent) {
+        match ev {
+            DevEvent::Added {
+                id,
+                desc,
+                grab_fd,
+                path,
+            } => {
+                for peer in self.links.keys() {
+                    self.send(
+                        peer,
+                        Msg::AddDevice {
+                            id,
+                            desc: desc.clone(),
+                        },
+                    );
+                }
+                if self.controlling.is_some()
+                    && let Err(e) = devices::set_grab(&grab_fd, true)
+                {
+                    log::warn!("grab {}: {e}", desc.name);
+                }
+                self.devices.insert(
+                    id,
+                    LocalDev {
+                        desc,
+                        grab_fd,
+                        state: InputState::new(),
+                        path,
+                    },
+                );
+            }
+            DevEvent::Removed { id } => {
+                self.devices.remove(&id);
+                for peer in self.links.keys() {
+                    self.send(peer, Msg::RemoveDevice { id });
+                }
+            }
+            DevEvent::Batch { id, events } => self.on_batch(id, events).await,
+        }
+    }
+
+    async fn on_batch(&mut self, id: u32, events: Vec<Ev>) {
+        let Some(dev) = self.devices.get_mut(&id) else {
+            return;
+        };
+        let (dx, dy) = dev.state.apply(&events);
+        let is_pointer = dev.desc.pointer || dev.desc.touchpad;
+
+        if let Some(c) = &self.controlling {
+            let peer = c.peer.clone();
+            if self.release_combo_held() {
+                log::info!("release keys pressed");
+                self.send(&peer, Msg::Leave);
+                self.stop_control("release keys", None).await;
+                return;
+            }
+            self.send(&peer, Msg::Input { id, events });
+            return;
+        }
+        if self.pending_switch.is_some() {
+            self.try_pending_switch().await;
+            if self.controlling.is_some() {
+                return;
+            }
+        }
+        if !is_pointer || (dx == 0.0 && dy == 0.0) || !self.enabled || self.controlled_by.is_some()
+        {
+            return;
+        }
+        // Which connected peers is this motion heading toward?
+        let targets: Vec<(String, Side)> = self
+            .cfg
+            .peers
+            .iter()
+            .filter(|p| self.links.contains_key(&p.name) && p.side.pushed_by(dx, dy))
+            .map(|p| (p.name.clone(), p.side))
+            .collect();
+        if targets.is_empty() || !self.out_watch.due() {
+            return;
+        }
+        let (Ok((x, y)), Ok(layout)) = (self.hypr.cursor().await, self.hypr.layout().await) else {
+            self.out_watch.after_query(1000.0);
+            return;
+        };
+        let dist = targets
+            .iter()
+            .map(|(_, s)| layout.distance_to(*s, x, y))
+            .fold(f64::MAX, f64::min);
+        self.out_watch.after_query(dist);
+        for (peer, side) in targets {
+            let Some(frac) = layout.at_edge(side, x, y) else {
+                continue;
+            };
+            if self.devices.values().any(|d| d.state.anything_held()) {
+                log::debug!("at {side:?} edge but a key/button is held");
+                return;
+            }
+            if self.cfg.block_when_fullscreen && self.hypr.fullscreen().await {
+                log::debug!("at {side:?} edge but a fullscreen window is focused");
+                return;
+            }
+            self.start_control(peer, side, frac).await;
+            return;
+        }
+    }
+
+    fn release_combo_held(&self) -> bool {
+        if self.release_codes.is_empty() {
+            return false;
+        }
+        let held: BTreeSet<u16> = self
+            .devices
+            .values()
+            .flat_map(|d| d.state.keys.iter().copied())
+            .collect();
+        self.release_codes.iter().all(|k| held.contains(k))
+    }
+
+    async fn start_control(&mut self, peer: String, side: Side, frac: f64) {
+        log::info!("→ controlling {peer} ({side:?} edge, {:.0}%)", frac * 100.0);
+        for d in self.devices.values() {
+            if let Err(e) = devices::set_grab(&d.grab_fd, true) {
+                log::warn!("grab {} ({}): {e}", d.desc.name, d.path.display());
+            }
+        }
+        self.send(
+            &peer,
+            Msg::Enter {
+                side: side.opposite(),
+                frac,
+            },
+        );
+        // Carry an ongoing swipe over to the other side.
+        for (id, d) in &self.devices {
+            if d.desc.touchpad {
+                let resume = d.state.touch_resume();
+                if !resume.is_empty() {
+                    self.send(
+                        &peer,
+                        Msg::Input {
+                            id: *id,
+                            events: resume,
+                        },
+                    );
+                }
+            }
+        }
+        let inhibit = tokio::process::Command::new("systemd-inhibit")
+            .args([
+                "--what=idle:sleep",
+                "--who=edgehop",
+                "--why=Controlling another machine",
+                "--mode=block",
+            ])
+            .args(["sleep", "infinity"])
+            .kill_on_drop(true)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|e| log::debug!("systemd-inhibit: {e}"))
+            .ok();
+        self.controlling = Some(Controlling {
+            peer,
+            side,
+            inhibit,
+        });
+    }
+
+    /// Give local input back. `back_at`: where along our edge the cursor returns.
+    async fn stop_control(&mut self, why: &str, back_at: Option<f64>) {
+        let Some(mut c) = self.controlling.take() else {
+            return;
+        };
+        for d in self.devices.values() {
+            if let Err(e) = devices::set_grab(&d.grab_fd, false) {
+                log::warn!("ungrab {}: {e}", d.desc.name);
+            }
+        }
+        if let Some(mut child) = c.inhibit.take() {
+            let _ = child.start_kill();
+        }
+        log::info!("← back from {} ({why})", c.peer);
+        if let Some(frac) = back_at
+            && let Ok(layout) = self.hypr.layout().await
+        {
+            let (x, y) = layout.entry_point(c.side, frac);
+            if let Err(e) = self.hypr.warp(x, y).await {
+                log::warn!("{e:#}");
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------- network
+
+    async fn on_net(&mut self, ev: NetEvent) {
+        match ev {
+            NetEvent::Up { peer, conn, tx } => {
+                if self.links.contains_key(&peer) {
+                    log::info!("{peer}: replacing older connection");
+                    self.peer_gone(&peer).await;
+                }
+                for (id, d) in &self.devices {
+                    let _ = tx.send(Msg::AddDevice {
+                        id: *id,
+                        desc: d.desc.clone(),
+                    });
+                }
+                self.links.insert(peer, Link { conn, tx });
+            }
+            NetEvent::Down { peer, conn } => {
+                if self.links.get(&peer).is_some_and(|l| l.conn == conn) {
+                    log::info!("{peer} disconnected");
+                    self.peer_gone(&peer).await;
+                }
+            }
+            NetEvent::Msg { peer, conn, msg } => {
+                if self.links.get(&peer).is_some_and(|l| l.conn == conn) {
+                    self.on_msg(&peer, msg).await;
+                }
+            }
+        }
+    }
+
+    async fn peer_gone(&mut self, peer: &str) {
+        self.links.remove(peer);
+        if self.controlling.as_ref().is_some_and(|c| c.peer == peer) {
+            self.stop_control("peer disconnected", None).await;
+        }
+        if self.controlled_by.as_ref().is_some_and(|c| c.peer == peer) {
+            self.controlled_by = None;
+        }
+        self.mirrors.retain(|(p, _), _| p != peer); // Drop lifts held keys
+    }
+
+    async fn on_msg(&mut self, peer: &str, msg: Msg) {
+        match msg {
+            Msg::Hello { .. } | Msg::Ping => {}
+            Msg::AddDevice { id, desc } => {
+                let name = desc.name.clone();
+                match Mirror::create(desc) {
+                    Ok(m) => {
+                        log::info!("{peer}: mirrored device {id} {name}");
+                        self.mirrors.insert((peer.to_string(), id), m);
+                    }
+                    Err(e) => log::warn!("{peer}: mirror {name}: {e:#}"),
+                }
+            }
+            Msg::RemoveDevice { id } => {
+                self.mirrors.remove(&(peer.to_string(), id));
+            }
+            Msg::Enter { side, frac } => {
+                if self.controlling.is_some() || !self.enabled {
+                    // Busy (we're driving someone else) or switched off: bounce.
+                    self.send(peer, Msg::Released { frac });
+                    return;
+                }
+                log::info!("← {peer} took over ({side:?} edge, {:.0}%)", frac * 100.0);
+                self.controlled_by = Some(ControlledBy {
+                    peer: peer.to_string(),
+                    side,
+                });
+                self.back_watch = EdgeWatch::new();
+                match self.hypr.layout().await {
+                    Ok(layout) => {
+                        let (x, y) = layout.entry_point(side, frac);
+                        if let Err(e) = self.hypr.warp(x, y).await {
+                            log::warn!("{e:#}");
+                        }
+                    }
+                    Err(e) => log::warn!("layout: {e:#}"),
+                }
+            }
+            Msg::Input { id, events } => {
+                let Some(cb) = &self.controlled_by else {
+                    return;
+                };
+                if cb.peer != peer {
+                    return;
+                }
+                let side = cb.side;
+                let Some(m) = self.mirrors.get_mut(&(peer.to_string(), id)) else {
+                    return;
+                };
+                let pointer = m.desc.pointer || m.desc.touchpad;
+                let (dx, dy) = match m.emit(&events) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        log::warn!("inject: {e}");
+                        return;
+                    }
+                };
+                if pointer && side.pushed_by(dx, dy) && self.back_watch.due() {
+                    self.check_return(peer, side).await;
+                }
+            }
+            Msg::Leave => {
+                if self.controlled_by.as_ref().is_some_and(|c| c.peer == peer) {
+                    log::info!("→ {peer} let go");
+                    self.release_mirrors(peer);
+                    self.controlled_by = None;
+                }
+            }
+            Msg::Released { frac } => {
+                if self.controlling.as_ref().is_some_and(|c| c.peer == peer) {
+                    self.stop_control("cursor came back", Some(frac)).await;
+                }
+            }
+        }
+    }
+
+    /// Receiver: has the cursor been pushed out through the edge facing
+    /// the controller? Then hand control back.
+    async fn check_return(&mut self, peer: &str, side: Side) {
+        let (Ok((x, y)), Ok(layout)) = (self.hypr.cursor().await, self.hypr.layout().await) else {
+            self.back_watch.after_query(1000.0);
+            return;
+        };
+        self.back_watch.after_query(layout.distance_to(side, x, y));
+        if let Some(frac) = layout.at_edge(side, x, y) {
+            log::info!("→ handing back to {peer}");
+            self.release_mirrors(peer);
+            self.controlled_by = None;
+            self.send(peer, Msg::Released { frac });
+        }
+    }
+
+    fn release_mirrors(&mut self, peer: &str) {
+        for ((p, _), m) in self.mirrors.iter_mut() {
+            if p == peer {
+                m.release_all();
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------- control socket
+
+    async fn try_pending_switch(&mut self) {
+        let Some((peer, side, deadline)) = self.pending_switch.clone() else {
+            return;
+        };
+        if Instant::now() > deadline
+            || !self.links.contains_key(&peer)
+            || self.controlled_by.is_some()
+        {
+            self.pending_switch = None;
+            return;
+        }
+        if self.devices.values().any(|d| d.state.anything_held()) {
+            return;
+        }
+        self.pending_switch = None;
+        let frac = match (self.hypr.cursor().await, self.hypr.layout().await) {
+            (Ok((x, y)), Ok(l)) => l.frac_of(side, x, y),
+            _ => 0.5,
+        };
+        self.start_control(peer, side, frac).await;
+    }
+
+    /// `edgehop switch [peer]`: jump to a peer (or back home) without the edge.
+    async fn switch(&mut self, want: Option<&str>) -> Result<(), String> {
+        if let Some(cb) = self.controlled_by.take() {
+            // Pressed on the controller's keyboard, run here: hand control back.
+            let frac = match (self.hypr.cursor().await, self.hypr.layout().await) {
+                (Ok((x, y)), Ok(l)) => l.frac_of(cb.side, x, y),
+                _ => 0.5,
+            };
+            log::info!("→ handing back to {} (switch)", cb.peer);
+            self.release_mirrors(&cb.peer);
+            self.send(&cb.peer, Msg::Released { frac });
+            return Ok(());
+        }
+        if let Some(c) = &self.controlling {
+            let peer = c.peer.clone();
+            self.send(&peer, Msg::Leave);
+            self.stop_control("edgehop switch", None).await;
+            return Ok(());
+        }
+        let peer = self
+            .cfg
+            .peers
+            .iter()
+            .find(|p| want.is_none_or(|w| w == p.name) && self.links.contains_key(&p.name))
+            .map(|p| (p.name.clone(), p.side));
+        let Some((peer, side)) = peer else {
+            return Err(match want {
+                Some(w) => format!("{w} is not connected (or not a peer)"),
+                None => "no peer is connected".into(),
+            });
+        };
+        self.pending_switch = Some((peer, side, Instant::now() + Duration::from_secs(3)));
+        self.try_pending_switch().await;
+        Ok(())
+    }
+
+    async fn on_control(&mut self, cmd: &str) -> String {
+        let (verb, arg) = match cmd.split_once(' ') {
+            Some((v, a)) => (v, Some(a.trim()).filter(|a| !a.is_empty())),
+            None => (cmd, None),
+        };
+        if verb == "switch" {
+            if let Err(e) = self.switch(arg).await {
+                return format!("error: {e}\n");
+            }
+            return self.status();
+        }
+        match cmd {
+            "status" | "" => {}
+            "toggle" => self.enabled = !self.enabled,
+            "enable" | "on" => self.enabled = true,
+            "disable" | "off" => self.enabled = false,
+            "release" => {
+                if let Some(c) = &self.controlling {
+                    let peer = c.peer.clone();
+                    self.send(&peer, Msg::Leave);
+                }
+                self.stop_control("edgehop release", None).await;
+            }
+            other => {
+                return format!(
+                    "unknown command {other:?} (status, switch [peer], toggle, enable, disable, release)\n"
+                );
+            }
+        }
+        if matches!(cmd, "toggle" | "enable" | "on" | "disable" | "off") && !self.enabled {
+            if let Some(c) = &self.controlling {
+                let peer = c.peer.clone();
+                self.send(&peer, Msg::Leave);
+            }
+            self.stop_control("disabled", None).await;
+        }
+        self.status()
+    }
+
+    fn status(&self) -> String {
+        let mut s = String::new();
+        s += &format!(
+            "name: {}\nenabled: {}\n",
+            self.cfg.name,
+            if self.enabled { "yes" } else { "no" }
+        );
+        for p in &self.cfg.peers {
+            let state = if self.links.contains_key(&p.name) {
+                "connected"
+            } else {
+                "not connected"
+            };
+            s += &format!("peer: {} ({}, {state})\n", p.name, side_word(p.side));
+        }
+        let mode = match (&self.controlling, &self.controlled_by) {
+            (Some(c), _) => format!("controlling {}", c.peer),
+            (_, Some(c)) => format!("controlled by {}", c.peer),
+            _ => "local".to_string(),
+        };
+        s += &format!("state: {mode}\n");
+        let mut names: Vec<&str> = self
+            .devices
+            .values()
+            .map(|d| d.desc.name.as_str())
+            .collect();
+        names.sort();
+        s += &format!("captured devices: {}\n", names.join(", "));
+        let mirrored = self.mirrors.len();
+        if mirrored > 0 {
+            s += &format!("mirrored devices: {mirrored}\n");
+        }
+        s
+    }
+}
+
+fn side_word(s: Side) -> &'static str {
+    match s {
+        Side::Left => "left",
+        Side::Right => "right",
+        Side::Top => "above",
+        Side::Bottom => "below",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::proto::Ev;
+
+    /// Live check against a running daemon that lists a peer named "probe"
+    /// on its `EDGEHOP_PROBE_SIDE` side (default left). Moves the real cursor:
+    /// EDGEHOP_PROBE_ADDR=host:port EDGEHOP_PROBE_PSK=… cargo test probe -- --ignored
+    #[tokio::test]
+    #[ignore]
+    async fn probe_enter_move_and_return() {
+        let addr = std::env::var("EDGEHOP_PROBE_ADDR").unwrap();
+        let psk = crate::config::Config {
+            name: String::new(),
+            listen: None,
+            psk: std::env::var("EDGEHOP_PROBE_PSK").unwrap(),
+            release_keys: vec![],
+            block_when_fullscreen: false,
+            ignore_devices: vec![],
+            peers: vec![],
+        }
+        .psk_bytes()
+        .unwrap();
+        // The daemon has us on its left, so we enter its left edge and leave through it.
+        let side: Side = match std::env::var("EDGEHOP_PROBE_SIDE").as_deref() {
+            Ok("right") => Side::Right,
+            _ => Side::Left,
+        };
+        let s = TcpStream::connect(addr).await.unwrap();
+        let (mut r, mut w) = proto::handshake(s, &psk, true).await.unwrap();
+        w.send(&Msg::Hello { name: "probe".into(), version: PROTOCOL_VERSION }).await.unwrap();
+        assert!(matches!(r.recv().await.unwrap(), Msg::Hello { .. }));
+        let desc = DeviceDesc {
+            name: "Probe mouse".into(),
+            bus: 3,
+            vendor: 0x1234,
+            product: 0x5678,
+            version: 1,
+            props: vec![],
+            keys: vec![0x110, 0x111, 0x112],
+            rel: vec![0, 1, 8],
+            abs: vec![],
+            msc: vec![],
+            pointer: true,
+            touchpad: false,
+            keyboard: false,
+        };
+        w.send(&Msg::AddDevice { id: 77, desc }).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        w.send(&Msg::Enter { side, frac: 0.5 }).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Move inward a bit, then back out through the edge we came in by.
+        let dir = if side == Side::Left { 1 } else { -1 };
+        for _ in 0..20 {
+            w.send(&Msg::Input { id: 77, events: vec![Ev { t: 2, c: 0, v: 10 * dir }] }).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let back = async {
+            loop {
+                if let Msg::Released { frac } = r.recv().await.unwrap() {
+                    return frac;
+                }
+            }
+        };
+        let pump = async {
+            for _ in 0..400 {
+                w.send(&Msg::Input { id: 77, events: vec![Ev { t: 2, c: 0, v: -10 * dir }] }).await.unwrap();
+                tokio::time::sleep(Duration::from_millis(4)).await;
+            }
+        };
+        tokio::select! {
+            frac = back => assert!((frac - 0.5).abs() < 0.05, "came back at {frac}"),
+            _ = pump => panic!("never handed back"),
+        }
+    }
+}
