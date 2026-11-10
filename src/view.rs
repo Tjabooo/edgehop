@@ -90,7 +90,12 @@ fn spawn(
         // stream nobody reads any more.
         .kill_on_drop(true)
         .spawn()
-        .with_context(|| format!("can't start {prog}"))
+        .map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => {
+                anyhow::anyhow!("{prog} isn't installed (not found in PATH)")
+            }
+            _ => anyhow::Error::new(e).context(format!("can't start {prog}")),
+        })
 }
 
 /// Watched side: capture the output named in `monitor` (restarting when it
@@ -159,7 +164,7 @@ pub async fn watch(mut r: Reader, w: Writer, player: Vec<String>) -> Result<()> 
     loop {
         tokio::select! {
             m = r.recv() => {
-                if let Msg::ViewData(d) = m.context("the stream ended")? {
+                if let Msg::ViewData(d) = m.context("the other side hung up the stream")? {
                     stdin.write_all(&d).await.context("the player closed")?;
                 }
             }
@@ -216,6 +221,13 @@ mod tests {
         let res = tokio::time::timeout(Duration::from_secs(3), server).await;
         assert!(matches!(res, Ok(Ok(Ok(())))), "{res:?}");
         let _ = std::fs::remove_file(&out);
+    }
+
+    #[tokio::test]
+    async fn missing_recorder_says_not_installed() {
+        let cmd = sv(&["edgehop-no-such-recorder", "-w", "DP-1"]);
+        let err = spawn(&cmd, Stdio::null(), Stdio::null(), Stdio::null()).unwrap_err();
+        assert!(err.to_string().contains("isn't installed"), "{err}");
     }
 
     #[tokio::test]

@@ -1228,7 +1228,14 @@ impl Daemon {
             );
             log::info!("view: showing {peer}");
             v.task = Some(Task::spawn(async move {
-                ended(net, view::watch(r, w, player).await);
+                let res = view::watch(r, w, player).await;
+                // When the watched side fails, its ViewFailed (with the real
+                // reason) races our end of the video link closing. Give it a
+                // moment to arrive so the user sees why, not just "eof".
+                if res.is_err() {
+                    tokio::time::sleep(Duration::from_millis(600)).await;
+                }
+                ended(net, res);
             }));
         } else if let Some(sv) = self
             .serving
