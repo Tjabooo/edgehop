@@ -83,6 +83,7 @@ fn spawn(
     let (prog, args) = cmd.split_first().context("empty command")?;
     Command::new(prog)
         .args(args)
+        .envs(crate::hypr::session_env())
         .stdin(stdin)
         .stdout(stdout)
         .stderr(stderr)

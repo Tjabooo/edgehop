@@ -82,6 +82,52 @@ fn find_socket() -> Option<PathBuf> {
     best.map(|(_, p)| p)
 }
 
+/// Session variables a child (screen recorder, video player) needs to reach
+/// the compositor but the daemon may lack: a systemd user unit started
+/// before Hyprland exported its environment has no WAYLAND_DISPLAY, and
+/// gpu-screen-recorder then fails with "failed to create window". Only
+/// variables missing from our own environment are returned.
+pub fn session_env() -> Vec<(&'static str, std::ffi::OsString)> {
+    let mut out = Vec::new();
+    let has = |k: &str| std::env::var_os(k).is_some_and(|v| !v.is_empty());
+    if !has("WAYLAND_DISPLAY")
+        && let Some(name) = newest_wayland_socket(&runtime_dir())
+    {
+        out.push(("WAYLAND_DISPLAY", name));
+    }
+    if !has("HYPRLAND_INSTANCE_SIGNATURE")
+        && let Some(sig) = find_socket()
+            .as_deref()
+            .and_then(|p| p.parent())
+            .and_then(|d| d.file_name())
+    {
+        out.push(("HYPRLAND_INSTANCE_SIGNATURE", sig.to_os_string()));
+    }
+    out
+}
+
+/// The newest `wayland-N` socket in `dir` (skipping `.lock` files).
+fn newest_wayland_socket(dir: &std::path::Path) -> Option<std::ffi::OsString> {
+    use std::os::unix::fs::FileTypeExt;
+    let mut best: Option<(std::time::SystemTime, std::ffi::OsString)> = None;
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        let name = entry.file_name();
+        let s = name.to_string_lossy();
+        if !s.starts_with("wayland-") || s.ends_with(".lock") {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else { continue };
+        if !meta.file_type().is_socket() {
+            continue;
+        }
+        let t = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+        if best.as_ref().is_none_or(|(bt, _)| t > *bt) {
+            best = Some((t, name));
+        }
+    }
+    best.map(|(_, n)| n)
+}
+
 impl Hypr {
     pub fn new() -> Hypr {
         Hypr {
@@ -203,5 +249,22 @@ impl Hypr {
             last = out;
         }
         bail!("cursor warp failed: {}", last.trim())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn finds_wayland_socket_skipping_locks_and_files() {
+        let dir = std::env::temp_dir().join(format!("edgehop-wl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("wayland-0.lock"), "").unwrap();
+        std::fs::write(dir.join("wayland-9"), "").unwrap(); // not a socket
+        let _l = std::os::unix::net::UnixListener::bind(dir.join("wayland-1")).unwrap();
+        assert_eq!(newest_wayland_socket(&dir).unwrap(), "wayland-1");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
