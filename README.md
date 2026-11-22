@@ -6,6 +6,8 @@
 
 edgehop links two (or more) Linux machines running Hyprland. Move the pointer off the edge that faces the other machine and it appears on that machine's screens; your keyboard goes with it. Push it back out the same way to come home. Your laptop touchpad works on the desktop like a real touchpad: gestures, tap-to-click, two-finger scroll and all.
 
+It fills the same gap as Synergy, Barrier, Input Leap or Mouse Without Borders (sharing one keyboard and mouse between computers), for Hyprland on Wayland, where those don't work well.
+
 ## Features
 
 - **Edge crossing.** Configure which side each machine sits on. Multi-monitor layouts work; only the outer edges count, not the seams between your own monitors.
