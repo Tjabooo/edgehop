@@ -139,6 +139,8 @@ codec = "h264"      # or "hevc"
 hint = "Super+Alt+L"  # named in the notifications
 ```
 
+**Lower latency on AMD/Intel:** stock gpu-screen-recorder holds about two encoded frames (VAAPI `async_depth` 3) before writing one out, roughly 33 ms at 60 fps. edgehop sets `GSR_ASYNC_DEPTH=1` for the recorder; a build patched to read it (one line in `src/recorder/video_codec.c`) sends each frame as soon as it's encoded. Point `capture` at that build, in a directory without its own `gsr-kms-server` so the system's setcap'd one is used.
+
 `capture` and `player` override the commands; see `config.example.toml` for the placeholders. A stream that breaks (recorder missing, monitor gone) shows a notification saying why, and remote view stays on for the next crossing.
 
 ## Usage

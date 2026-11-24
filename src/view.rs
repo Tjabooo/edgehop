@@ -93,6 +93,9 @@ fn spawn(
     Command::new(prog)
         .args(args)
         .envs(crate::hypr::session_env())
+        // gpu-screen-recorder builds that read it hand out each frame as soon as
+        // it is encoded instead of holding ~2 (VAAPI async_depth); others ignore it.
+        .env("GSR_ASYNC_DEPTH", "1")
         .stdin(stdin)
         .stdout(stdout)
         .stderr(stderr)
