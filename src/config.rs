@@ -55,7 +55,8 @@ pub struct ViewConfig {
     pub codec: String,
     /// Your `edgehop view` keybind, named in the notifications.
     pub hint: Option<String>,
-    /// Command printing a raw Annex-B stream of one output to stdout.
+    /// Command printing a raw Annex-B stream of one output to stdout (a socket:
+    /// write to `pipe:1`, not `/dev/stdout`, which can't be reopened).
     /// Placeholders: {monitor} {fps} {kbps} {codec}.
     pub capture: Vec<String>,
     /// Command showing that stream (read from stdin) full screen.
@@ -89,7 +90,7 @@ impl Default for ViewConfig {
                 "-c",
                 "{codec}",
                 "-o",
-                "/dev/stdout",
+                "pipe:1",
             ]),
             player: v(&[
                 "mpv",
@@ -102,6 +103,12 @@ impl Default for ViewConfig {
                 "--demuxer-lavf-probesize=32",
                 "--demuxer-lavf-analyzeduration=0",
                 "--hwdec=auto",
+                // Show each frame the moment it's decoded: one image in flight,
+                // no waiting for vsync (pair with a compositor tearing rule).
+                "--swapchain-depth=1",
+                "--vulkan-swap-mode=immediate",
+                "--wayland-internal-vsync=no",
+                "--wayland-content-type=game",
                 "--no-audio",
                 "--fs",
                 "--no-border",

@@ -4,13 +4,22 @@
 //! link, so a busy video stream never delays input on the main link.
 //! Moving the cursor to another output restarts the capture there; the
 //! stream is raw Annex-B, so the player just carries on with the new one.
+//!
+//! Latency: a raw Annex-B stream has no frame lengths, so the player's parser
+//! only knows a frame is complete when the next one starts: one whole frame
+//! of delay (17 ms at 60 fps). gpu-screen-recorder writes each frame in
+//! 32 KiB chunks and flushes the rest at the frame's end, so its stdout is a
+//! SOCK_SEQPACKET socket (which keeps those write boundaries) and every short
+//! write gets an access unit delimiter appended: the parser sees "next frame
+//! starts here" right away and hands the frame on without waiting.
 
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::process::Command;
 use tokio::sync::watch;
@@ -99,6 +108,97 @@ fn spawn(
         })
 }
 
+/// gpu-screen-recorder's write size inside a frame (ffmpeg's AVIO buffer);
+/// any other size ends a frame.
+const GSR_CHUNK: usize = 32768;
+
+/// Access unit delimiter for `codec`: tells the parser a new frame begins.
+fn access_unit_delimiter(codec: &str) -> Option<&'static [u8]> {
+    match codec {
+        "h264" => Some(&[0, 0, 0, 1, 0x09, 0xf0]),
+        "hevc" => Some(&[0, 0, 0, 1, 0x46, 0x01, 0x50]),
+        _ => None,
+    }
+}
+
+/// The delimiter to append after each finished frame, when the capture is
+/// gpu-screen-recorder (whose write pattern marks frame ends).
+fn frame_end_marker(cmd: &[String]) -> Option<&'static [u8]> {
+    let prog = cmd.first()?;
+    if !prog.ends_with("gpu-screen-recorder") {
+        return None;
+    }
+    let codec = cmd.iter().skip_while(|a| *a != "-k").nth(1)?;
+    access_unit_delimiter(codec)
+}
+
+/// One write from the recorder → link-sized pieces, with `frame_end`
+/// appended when the write finished a frame.
+fn pieces(msg: &[u8], frame_end: Option<&[u8]>, max: usize) -> Vec<Vec<u8>> {
+    let mut data = msg.to_vec();
+    if let Some(aud) = frame_end
+        && msg.len() != GSR_CHUNK
+    {
+        data.extend_from_slice(aud);
+    }
+    data.chunks(max).map(|c| c.to_vec()).collect()
+}
+
+/// A SOCK_SEQPACKET pair: (our nonblocking read end, the child's stdout).
+fn packet_pair() -> Result<(tokio::io::unix::AsyncFd<OwnedFd>, OwnedFd)> {
+    let mut fds = [0; 2];
+    // SAFETY: socketpair fills `fds` with two new descriptors on success.
+    let rc = unsafe {
+        libc::socketpair(
+            libc::AF_UNIX,
+            libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
+            0,
+            fds.as_mut_ptr(),
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error()).context("socketpair");
+    }
+    // SAFETY: both fds were just created and are owned by nobody else.
+    let (ours, theirs) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+    // SAFETY: plain fcntl on a descriptor we own.
+    unsafe {
+        let fl = libc::fcntl(ours.as_raw_fd(), libc::F_GETFL);
+        libc::fcntl(ours.as_raw_fd(), libc::F_SETFL, fl | libc::O_NONBLOCK);
+    }
+    // SAFETY: `ours` stays open and unreplaced for as long as the AsyncFd owns it.
+    let ours = unsafe { tokio::io::unix::AsyncFd::register(ours)? };
+    Ok((ours, theirs))
+}
+
+/// Next whole write from the recorder (empty = it closed its end).
+async fn recv_packet(fd: &tokio::io::unix::AsyncFd<OwnedFd>, buf: &mut [u8]) -> Result<usize> {
+    loop {
+        let mut guard = fd.readable().await?;
+        let res = guard.try_io(|inner| {
+            // SAFETY: recv into our own buffer; MSG_TRUNC reports the real size.
+            let n = unsafe {
+                libc::recv(
+                    inner.as_raw_fd(),
+                    buf.as_mut_ptr().cast(),
+                    buf.len(),
+                    libc::MSG_TRUNC,
+                )
+            };
+            if n < 0 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(n as usize)
+            }
+        });
+        match res {
+            Ok(Ok(n)) if n > buf.len() => bail!("recorder wrote {n} bytes at once"),
+            Ok(r) => return Ok(r?),
+            Err(_would_block) => continue,
+        }
+    }
+}
+
 /// Watched side: capture the output named in `monitor` (restarting when it
 /// changes) and send it down the link until the viewer hangs up.
 pub async fn serve(
@@ -113,13 +213,24 @@ pub async fn serve(
         while r.recv().await.is_ok() {}
         let _ = gone_tx.send(());
     });
-    let mut buf = vec![0u8; MAX_PAYLOAD - 64];
+    let mut buf = vec![0u8; 4 << 20];
     loop {
         let mon = monitor.borrow_and_update().clone();
-        let cmd = crate::config::fill(&capture, &[("monitor", &mon)]);
+        // A socket can't be reopened through /dev/stdout; ffmpeg's pipe:1 writes fd 1.
+        let cmd: Vec<String> = crate::config::fill(&capture, &[("monitor", &mon)])
+            .into_iter()
+            .map(|a| {
+                if a == "/dev/stdout" {
+                    "pipe:1".into()
+                } else {
+                    a
+                }
+            })
+            .collect();
+        let frame_end = frame_end_marker(&cmd);
         log::info!("view: streaming {mon}");
-        let mut child = spawn(&cmd, Stdio::null(), Stdio::piped(), Stdio::piped())?;
-        let mut out = child.stdout.take().context("no stdout")?;
+        let (out, child_out) = packet_pair()?;
+        let mut child = spawn(&cmd, Stdio::null(), Stdio::from(child_out), Stdio::piped())?;
         // Keep the recorder's last words for the error message.
         let last_err = Arc::new(Mutex::new(String::new()));
         if let Some(err) = child.stderr.take() {
@@ -135,14 +246,16 @@ pub async fn serve(
         }
         loop {
             tokio::select! {
-                n = out.read(&mut buf) => {
+                n = recv_packet(&out, &mut buf) => {
                     let n = n?;
                     if n == 0 {
                         let st = child.wait().await?;
                         let why = last_err.lock().unwrap().clone();
                         bail!("capturing {mon} stopped ({st}){}{why}", if why.is_empty() { "" } else { ": " });
                     }
-                    w.send(&Msg::ViewData(buf[..n].to_vec())).await?;
+                    for piece in pieces(&buf[..n], frame_end, MAX_PAYLOAD - 64) {
+                        w.send(&Msg::ViewData(piece)).await?;
+                    }
                 }
                 ch = monitor.changed() => {
                     if ch.is_err() {
@@ -222,6 +335,36 @@ mod tests {
         let res = tokio::time::timeout(Duration::from_secs(3), server).await;
         assert!(matches!(res, Ok(Ok(Ok(())))), "{res:?}");
         let _ = std::fs::remove_file(&out);
+    }
+
+    #[test]
+    fn frame_ends_get_a_delimiter() {
+        let aud = access_unit_delimiter("h264");
+        // A 32 KiB chunk is mid-frame: untouched.
+        let mid = vec![7u8; GSR_CHUNK];
+        assert_eq!(pieces(&mid, aud, 60000), vec![mid.clone()]);
+        // A short write ends the frame: delimiter appended.
+        assert_eq!(
+            pieces(&[1, 2, 3], aud, 60000),
+            vec![vec![1, 2, 3, 0, 0, 0, 1, 0x09, 0xf0]]
+        );
+        // Big writes are split to fit the link.
+        let big = pieces(&[5u8; 100], None, 40);
+        assert_eq!(
+            big.iter().map(Vec::len).collect::<Vec<_>>(),
+            vec![40, 40, 20]
+        );
+        let gsr = sv(&[
+            "gpu-screen-recorder",
+            "-w",
+            "DP-1",
+            "-k",
+            "hevc",
+            "-o",
+            "pipe:1",
+        ]);
+        assert_eq!(frame_end_marker(&gsr), access_unit_delimiter("hevc"));
+        assert_eq!(frame_end_marker(&sv(&["sh", "-c", "x"])), None);
     }
 
     #[tokio::test]
