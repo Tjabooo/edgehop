@@ -873,7 +873,10 @@ impl Daemon {
                 fps,
                 kbps,
                 codec,
-            } => self.on_view_start(peer, session, fps, kbps, &codec).await,
+            } => {
+                self.notifier.hide_arrived();
+                self.on_view_start(peer, session, fps, kbps, &codec).await
+            }
             Msg::ViewStop { session } => {
                 if self.serving.as_ref().is_some_and(|s| s.session == session) {
                     log::info!("view: {peer} stopped watching");
@@ -1042,9 +1045,21 @@ impl Daemon {
         let on = on.unwrap_or(!self.view_on);
         self.view_on = on;
         log::info!("remote view {}", if on { "on" } else { "off" });
-        let peer = self.controlling.as_ref().map(|c| c.peer.clone());
-        self.notifier
-            .view_switched(on, peer.as_deref(), self.cfg.view.hint.as_deref());
+        match self.controlling.as_ref().map(|c| (c.peer.clone(), c.side)) {
+            // Driving: the picture appearing (or going) says it all; no note on
+            // top of the stream. Off again brings the persistent "Driving" note back.
+            Some((peer, side)) => {
+                if on {
+                    self.notifier.hide_driving();
+                } else {
+                    self.notifier
+                        .driving(&peer, side.opposite(), &self.ways_back, false);
+                }
+            }
+            None => self
+                .notifier
+                .view_switched(on, None, self.cfg.view.hint.as_deref()),
+        }
         if on {
             self.begin_view();
         } else {
