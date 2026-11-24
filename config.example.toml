@@ -35,7 +35,7 @@ ignore_devices = []
 [view]
 on = true
 # What you ask for when watching (the other machine encodes it).
-fps = 60
+fps = 0                   # 0 = this screen's refresh rate (e.g. 120 at 120 Hz)
 bitrate_kbps = 20000
 codec = "h264"            # or "hevc"
 # hint = "Super+Alt+L"    # your `edgehop view` keybind, named in notifications

@@ -49,6 +49,8 @@ pub struct ViewConfig {
     /// Start with remote view switched on (else `edgehop view` turns it on).
     pub on: bool,
     /// What you ask the other machine for when watching it.
+    /// 0 (the default) = this machine's screen refresh rate, e.g. 120 on a
+    /// laptop at 120 Hz and 60 when it drops to 60 Hz on battery.
     pub fps: u32,
     pub bitrate_kbps: u32,
     /// "h264" or "hevc".
@@ -69,7 +71,7 @@ impl Default for ViewConfig {
         let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         ViewConfig {
             on: false,
-            fps: 60,
+            fps: 0,
             bitrate_kbps: 20000,
             codec: "h264".into(),
             hint: None,
@@ -294,5 +296,26 @@ mod tests {
         let play = fill(&cfg.view.player, &[("codec", "hevc"), ("peer", "magi")]);
         assert!(play.contains(&"--demuxer-lavf-format=hevc".to_string()));
         assert!(play.contains(&"--title=edgehop: magi".to_string()));
+    }
+}
+
+/// The frame rate to ask for: `fps`, or (when 0) the screen's refresh rate,
+/// kept within what a recorder sensibly does.
+pub fn view_fps(fps: u32, screen_hz: Option<f64>) -> u32 {
+    if fps > 0 {
+        return fps;
+    }
+    screen_hz.map_or(60, |hz| (hz.round() as u32).clamp(30, 240))
+}
+
+#[cfg(test)]
+mod fps_tests {
+    #[test]
+    fn auto_fps_follows_the_screen() {
+        assert_eq!(super::view_fps(0, Some(119.88)), 120);
+        assert_eq!(super::view_fps(0, Some(60.0)), 60);
+        assert_eq!(super::view_fps(0, None), 60);
+        assert_eq!(super::view_fps(0, Some(500.0)), 240);
+        assert_eq!(super::view_fps(90, Some(120.0)), 90);
     }
 }

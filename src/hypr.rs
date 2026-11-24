@@ -16,6 +16,8 @@ const LAYOUT_TTL: Duration = Duration::from_secs(2);
 const FULLSCREEN_TTL: Duration = Duration::from_millis(750);
 
 pub struct Hypr {
+    /// Highest refresh rate among enabled monitors at the last layout query.
+    max_hz: Option<f64>,
     socket: Option<PathBuf>,
     layout: Option<(Instant, Layout)>,
     fullscreen: Option<(Instant, bool)>,
@@ -39,6 +41,8 @@ struct Monitor {
     width: f64,
     height: f64,
     scale: f64,
+    #[serde(default, rename = "refreshRate")]
+    refresh_rate: f64,
     #[serde(default)]
     transform: i64,
     #[serde(default)]
@@ -135,6 +139,7 @@ impl Hypr {
             layout: None,
             fullscreen: None,
             legacy_dispatch: None,
+            max_hz: None,
         }
     }
 
@@ -163,6 +168,12 @@ impl Hypr {
         unreachable!()
     }
 
+    /// This machine's fastest screen refresh rate, from the last layout query
+    /// (which runs on every edge check, so it's fresh when a crossing starts).
+    pub fn screen_hz(&self) -> Option<f64> {
+        self.max_hz
+    }
+
     pub async fn cursor(&mut self) -> Result<(f64, f64)> {
         let out = self.request("j/cursorpos").await?;
         let c: CursorPos =
@@ -183,6 +194,11 @@ impl Hypr {
             .iter()
             .filter(|m| !m.disabled && m.scale > 0.0)
             .collect();
+        self.max_hz = mons
+            .iter()
+            .map(|m| m.refresh_rate)
+            .filter(|hz| *hz > 0.0)
+            .reduce(f64::max);
         let names: Vec<String> = mons.iter().map(|m| m.name.clone()).collect();
         let monitors: Vec<Rect> = mons
             .iter()

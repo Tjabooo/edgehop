@@ -1078,9 +1078,9 @@ impl Daemon {
         let peer = c.peer.clone();
         let session = view::session_id();
         let v = &self.cfg.view;
+        let fps = crate::config::view_fps(v.fps, self.hypr.screen_hz());
         log::info!(
-            "view: asking {peer} for its screen ({} fps, {} kb/s {})",
-            v.fps,
+            "view: asking {peer} for its screen ({fps} fps, {} kb/s {})",
             v.bitrate_kbps,
             v.codec
         );
@@ -1088,7 +1088,7 @@ impl Daemon {
             &peer,
             Msg::ViewStart {
                 session,
-                fps: v.fps,
+                fps,
                 kbps: v.bitrate_kbps,
                 codec: v.codec.clone(),
             },

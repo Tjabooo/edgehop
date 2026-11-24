@@ -131,7 +131,7 @@ When you drive a machine whose screens you can't see (a desktop in another room,
 ```toml
 [view]
 on = false          # start with remote view on
-fps = 60
+fps = 0             # 0 = match this screen's refresh rate (120 Hz screen → 120 fps)
 bitrate_kbps = 20000
 codec = "h264"      # or "hevc"
 hint = "Super+Alt+L"  # named in the notifications
