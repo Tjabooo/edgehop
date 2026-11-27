@@ -64,6 +64,16 @@ pub struct ViewConfig {
     /// Command showing that stream (read from stdin) full screen.
     /// Placeholders: {codec} {peer}.
     pub player: Vec<String>,
+    /// Hear the machine you watch (asked for by the viewer).
+    pub audio: bool,
+    /// What this machine sends when watched: a PipeWire sink whose output is
+    /// recorded (e.g. a game-only bus). Empty = the default output.
+    pub audio_source: String,
+    /// Command printing raw s16 stereo 48 kHz PCM to stdout.
+    /// Placeholders: {audio_source} (an option left empty is dropped).
+    pub audio_capture: Vec<String>,
+    /// Command playing that PCM from stdin. Placeholders: {peer}.
+    pub audio_player: Vec<String>,
 }
 
 impl Default for ViewConfig {
@@ -122,6 +132,42 @@ impl Default for ViewConfig {
                 "--no-input-default-bindings",
                 "--input-vo-keyboard=no",
                 "--background-color=#000000",
+                "-",
+            ]),
+            audio: true,
+            audio_source: String::new(),
+            audio_capture: v(&[
+                "pw-record",
+                "--raw",
+                "--rate",
+                "48000",
+                "--channels",
+                "2",
+                "--format",
+                "s16",
+                "--latency",
+                "10ms",
+                "-P",
+                "stream.capture.sink=true node.name=edgehop-sound",
+                "--target",
+                "{audio_source}",
+                "-",
+            ]),
+            audio_player: v(&[
+                "pw-play",
+                "--raw",
+                "--rate",
+                "48000",
+                "--channels",
+                "2",
+                "--format",
+                "s16",
+                "--latency",
+                "20ms",
+                "--media-role",
+                "Game",
+                "-P",
+                "node.name=edgehop-sound",
                 "-",
             ]),
         }

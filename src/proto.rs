@@ -12,7 +12,7 @@ use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 
 use crate::geometry::Side;
 
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 const NOISE_PARAMS: &str = "Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s";
 const MAX_FRAME: usize = 65535;
 /// Keep plaintext well under the Noise limit (65535 incl. 16-byte tag).
@@ -68,6 +68,8 @@ pub enum Msg {
         /// Some(session): this connection only carries remote-view video for
         /// that session (main links say None).
         video: Option<u64>,
+        /// With `video`: this link carries that session's sound instead.
+        audio: bool,
     },
     Ping,
     // controller → receiver
@@ -116,6 +118,8 @@ pub enum Msg {
         fps: u32,
         kbps: u32,
         codec: String,
+        /// Also send the sound (over its own link).
+        audio: bool,
     },
     ViewStop {
         session: u64,

@@ -129,6 +129,7 @@ When you drive a machine whose screens you can't see (a desktop in another room,
 
 - It streams the monitor the cursor is on, full screen. Move the cursor to another monitor and the view switches to it (about 0.15 s).
 - The setting stays on: every crossing opens the view, coming back closes it. `edgehop view` (or `view on` / `view off`) changes it, also while you're over there.
+- Sound comes along: the watched machine records an output with `pw-record` (the default one, or a game-only sink via `audio_source`) and sends raw 48 kHz PCM over a third link; the viewer plays it with `pw-play`, keeping at most 40 ms queued (it skips a sliver rather than drifting behind after a hiccup). If sound fails, the picture carries on.
 - The watched machine encodes with `gpu-screen-recorder` (hardware H.264/HEVC, cursor included) and sends a raw stream over a second Noise link, dialed the same way as the main one. The viewer pipes it into `mpv` tuned for low latency (`--untimed`, no cache).
 
 ```toml
@@ -138,6 +139,8 @@ fps = 0             # 0 = match this screen's refresh rate (120 Hz screen → 12
 bitrate_kbps = 20000
 codec = "h264"      # or "hevc"
 hint = "Super+Alt+L"  # named in the notifications
+audio = true        # hear the machine you watch
+audio_source = ""   # what this machine sends when watched: a sink name, e.g. a game-only bus; "" = default output
 ```
 
 **Lower latency on AMD/Intel:** stock gpu-screen-recorder holds about two encoded frames (VAAPI `async_depth` 3) before writing one out, roughly 33 ms at 60 fps. edgehop sets `GSR_ASYNC_DEPTH=1` for the recorder; a build patched to read it (one line in `src/recorder/video_codec.c`) sends each frame as soon as it's encoded. Point `capture` at that build, in a directory without its own `gsr-kms-server` so the system's setcap'd one is used.
@@ -194,8 +197,8 @@ Devices are announced when the link comes up (and on hotplug), so the copies alr
 
 - Hyprland only for now: the cursor and layout queries go through its IPC. Capture and injection are compositor-independent, so other compositors need only a small adapter.
 - Clipboard sharing isn't built in.
-- Remote view is video only (no sound) and needs both machines on the same protocol version (0.2+).
-- Gamepads need protocol 3 (0.3+) on both machines. Motion sensors (DualSense/DualShock gyro) and controller LEDs aren't forwarded.
+- Remote view sound is uncompressed PCM (~1.5 Mb/s) and needs PipeWire (`pw-record`/`pw-play`) on both machines.
+- Both machines must run the same protocol version (0.4 for sound). Gamepads need 0.3+. Motion sensors (DualSense/DualShock gyro) and controller LEDs aren't forwarded.
 - A fullscreen game that locks the pointer can't be left through the edge; use the release keys or the `switch` bind.
 
 ## License

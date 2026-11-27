@@ -4,6 +4,8 @@ All notable changes to this project are listed here ([Keep a Changelog](https://
 
 ## [Unreleased]
 
+- Remote view sound: the watched machine's output (or one sink, `audio_source`) plays on the viewer over its own link, at most 40 ms queued. `[view] audio`, `audio_capture`, `audio_player`.
+- Protocol version 4: update every machine together.
 - Gamepads: controllers, joysticks and wheels follow the keyboard and mouse to the machine you drive, with rumble played back on the real pad. Sticks and triggers rest when you leave; their position carries over when you cross.
 - Protocol version 3: update every machine together.
 - Fix touchpads becoming unresponsive after a handover by restoring per-finger tool type and other touch attributes, including inactive slots.

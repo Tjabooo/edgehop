@@ -34,6 +34,7 @@ enum NetEvent {
     VideoLink {
         peer: String,
         session: u64,
+        audio: bool,
         r: proto::Reader,
         w: proto::Writer,
     },
@@ -87,6 +88,7 @@ struct Viewing {
     peer: String,
     session: u64,
     task: Option<Task>,
+    audio_task: Option<Task>,
 }
 
 /// Watched: we're streaming our screen to `peer`.
@@ -96,6 +98,9 @@ struct Serving {
     capture: Vec<String>,
     monitor: watch::Sender<String>,
     task: Option<Task>,
+    /// Sound capture command, when the viewer asked for sound.
+    audio_capture: Option<Vec<String>>,
+    audio_task: Option<Task>,
 }
 
 const FOLLOW_EVERY: Duration = Duration::from_millis(40);
@@ -368,12 +373,14 @@ async fn connection(
             name: me.clone(),
             version: PROTOCOL_VERSION,
             video: None,
+            audio: false,
         })
         .await?;
         let Msg::Hello {
             name,
             version,
             video,
+            audio,
         } = r.recv().await?
         else {
             bail!("expected hello")
@@ -387,9 +394,9 @@ async fn connection(
         if want.as_ref().is_some_and(|w| *w != name) {
             bail!("expected {:?}, got {name:?}", want.unwrap());
         }
-        Ok((r, w, name, video))
+        Ok((r, w, name, video, audio))
     };
-    let (mut r, mut w, peer, video) =
+    let (mut r, mut w, peer, video, audio) =
         match tokio::time::timeout(Duration::from_secs(5), setup).await {
             Ok(Ok(x)) => x,
             Ok(Err(e)) => {
@@ -402,10 +409,14 @@ async fn connection(
             }
         };
     if let Some(session) = video {
-        log::debug!("{peer}: video link for view {session:x}");
+        log::debug!(
+            "{peer}: {} link for view {session:x}",
+            if audio { "sound" } else { "video" }
+        );
         let _ = net.send(NetEvent::VideoLink {
             peer,
             session,
+            audio,
             r,
             w,
         });
@@ -764,9 +775,17 @@ impl Daemon {
             NetEvent::VideoLink {
                 peer,
                 session,
+                audio: false,
                 r,
                 w,
             } => self.on_video_link(&peer, session, r, w),
+            NetEvent::VideoLink {
+                peer,
+                session,
+                audio: true,
+                r,
+                w,
+            } => self.on_sound_link(&peer, session, r, w),
             NetEvent::ViewEnded { session, why } => self.on_view_ended(session, &why),
             NetEvent::Down { peer, conn } => {
                 if self.links.get(&peer).is_some_and(|l| l.conn == conn) {
@@ -928,9 +947,11 @@ impl Daemon {
                 fps,
                 kbps,
                 codec,
+                audio,
             } => {
                 self.notifier.hide_arrived();
-                self.on_view_start(peer, session, fps, kbps, &codec).await
+                self.on_view_start(peer, session, fps, kbps, &codec, audio)
+                    .await
             }
             Msg::ViewStop { session } => {
                 if self.serving.as_ref().is_some_and(|s| s.session == session) {
@@ -1198,14 +1219,19 @@ impl Daemon {
                 fps,
                 kbps: v.bitrate_kbps,
                 codec: v.codec.clone(),
+                audio: v.audio,
             },
         );
         self.viewing = Some(Viewing {
             peer: peer.clone(),
             session,
             task: None,
+            audio_task: None,
         });
-        self.dial_video(&peer, session);
+        self.dial_video(&peer, session, false);
+        if self.cfg.view.audio {
+            self.dial_video(&peer, session, true);
+        }
     }
 
     fn end_view(&mut self) {
@@ -1227,7 +1253,7 @@ impl Daemon {
 
     /// Whoever dialed the main link dials the video link too (the other side
     /// may not accept connections at all).
-    fn dial_video(&self, peer: &str, session: u64) {
+    fn dial_video(&self, peer: &str, session: u64, audio: bool) {
         if !self.links.get(peer).is_some_and(|l| l.initiator) {
             return; // the peer dials us
         }
@@ -1248,13 +1274,18 @@ impl Daemon {
             peer.to_string(),
         );
         tokio::spawn(async move {
-            let ev = match view::dial(&addr, psk, &me, &want, session).await {
+            let ev = match view::dial(&addr, psk, &me, &want, session, audio).await {
                 Ok((r, w)) => NetEvent::VideoLink {
                     peer: want,
                     session,
+                    audio,
                     r,
                     w,
                 },
+                Err(e) if audio => {
+                    log::warn!("view: sound link to {want}: {e:#}");
+                    return;
+                }
                 Err(e) => NetEvent::ViewEnded {
                     session,
                     why: format!("video link to {want}: {e:#}"),
@@ -1265,7 +1296,15 @@ impl Daemon {
     }
 
     /// Watched: the machine driving us wants to see our screen.
-    async fn on_view_start(&mut self, peer: &str, session: u64, fps: u32, kbps: u32, codec: &str) {
+    async fn on_view_start(
+        &mut self,
+        peer: &str,
+        session: u64,
+        fps: u32,
+        kbps: u32,
+        codec: &str,
+        audio: bool,
+    ) {
         if !self.controlled_by.as_ref().is_some_and(|c| c.peer == peer) {
             self.send(
                 peer,
@@ -1297,15 +1336,63 @@ impl Daemon {
         );
         log::info!("view: {peer} is watching (starting on {monitor})");
         let (tx, _) = watch::channel(monitor);
+        let v = &self.cfg.view;
+        let audio_capture = (audio && !v.audio_capture.is_empty()).then(|| {
+            view::drop_empty_options(crate::config::fill(
+                &v.audio_capture,
+                &[("audio_source", &v.audio_source)],
+            ))
+        });
         self.serving = Some(Serving {
             peer: peer.to_string(),
             session,
             capture,
             monitor: tx,
             task: None,
+            audio_capture,
+            audio_task: None,
         });
         self.follow_next = Instant::now() + FOLLOW_EVERY;
-        self.dial_video(peer, session);
+        self.dial_video(peer, session, false);
+        if audio {
+            self.dial_video(peer, session, true);
+        }
+    }
+
+    /// The sound link of a view came up. Sound is a bonus: when it fails,
+    /// the picture carries on and the log says why.
+    fn on_sound_link(&mut self, peer: &str, session: u64, r: proto::Reader, w: proto::Writer) {
+        if let Some(v) = self
+            .viewing
+            .as_mut()
+            .filter(|v| v.peer == peer && v.session == session && v.audio_task.is_none())
+        {
+            let player = crate::config::fill(&self.cfg.view.audio_player, &[("peer", peer)]);
+            let who = peer.to_string();
+            v.audio_task = Some(Task::spawn(async move {
+                match view::play_audio(r, w, player).await {
+                    Ok(()) => {}
+                    Err(e) => log::warn!("view: sound from {who}: {e:#}"),
+                }
+            }));
+        } else if let Some(sv) = self
+            .serving
+            .as_mut()
+            .filter(|s| s.peer == peer && s.session == session && s.audio_task.is_none())
+        {
+            let Some(capture) = sv.audio_capture.clone() else {
+                return;
+            };
+            log::info!("view: sending sound to {peer}");
+            let who = peer.to_string();
+            sv.audio_task = Some(Task::spawn(async move {
+                if let Err(e) = view::serve_audio(w, r, capture).await {
+                    log::warn!("view: sound for {who}: {e:#}");
+                }
+            }));
+        } else {
+            log::debug!("{peer}: sound link for unknown view {session:x}, dropped");
+        }
     }
 
     async fn monitor_under_cursor(&mut self) -> Option<String> {
@@ -1486,6 +1573,7 @@ mod tests {
             name: "probe".into(),
             version: PROTOCOL_VERSION,
             video: None,
+            audio: false,
         })
         .await
         .unwrap();
@@ -1586,6 +1674,7 @@ mod tests {
             name: "probe".into(),
             version: PROTOCOL_VERSION,
             video: None,
+            audio: false,
         })
         .await
         .unwrap();

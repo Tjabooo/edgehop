@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::process::Command;
 use tokio::sync::watch;
@@ -50,13 +50,14 @@ pub fn session_id() -> u64 {
     u64::from_le_bytes(b) | 1
 }
 
-/// Open a video link for `session` to `want` at `addr`.
+/// Open a video (or, with `audio`, sound) link for `session` to `want` at `addr`.
 pub async fn dial(
     addr: &str,
     psk: [u8; 32],
     me: &str,
     want: &str,
     session: u64,
+    audio: bool,
 ) -> Result<(Reader, Writer)> {
     let go = async {
         let s = TcpStream::connect(addr).await?;
@@ -65,6 +66,7 @@ pub async fn dial(
             name: me.to_string(),
             version: PROTOCOL_VERSION,
             video: Some(session),
+            audio,
         })
         .await?;
         let Msg::Hello { name, version, .. } = r.recv().await? else {
@@ -290,6 +292,145 @@ pub async fn watch(mut r: Reader, w: Writer, player: Vec<String>) -> Result<()> 
     }
 }
 
+// ------------------------------------------------------------------ sound
+//
+// Sound rides a third link as raw PCM (s16 stereo, 48 kHz: ~1.5 Mb/s, small
+// next to the video): no codec delay, and pw-record/pw-play do the work.
+// Delay stays bounded on the viewer: whatever the player hasn't read yet is
+// measured before each write, and a chunk that would push it past
+// AUDIO_MAX_QUEUED is dropped (a tiny skip instead of growing delay after
+// a network hiccup or clock drift).
+
+/// Bytes per frame on the wire (s16 stereo): chunks are whole frames.
+const AUDIO_FRAME: usize = 4;
+/// Largest chunk: 10 ms, well under PIPE_BUF so a write is all or nothing.
+const AUDIO_CHUNK: usize = 1920;
+/// Most sound waiting for the player: 40 ms.
+const AUDIO_MAX_QUEUED: usize = 7680;
+
+/// Kill-on-drop child plus the last error line it printed.
+fn spawn_logged(
+    cmd: &[String],
+    stdin: Stdio,
+    stdout: Stdio,
+) -> Result<(tokio::process::Child, Arc<Mutex<String>>)> {
+    let mut child = spawn(cmd, stdin, stdout, Stdio::piped())?;
+    let last_err = Arc::new(Mutex::new(String::new()));
+    if let Some(err) = child.stderr.take() {
+        let last = last_err.clone();
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(err).lines();
+            while let Ok(Some(l)) = lines.next_line().await {
+                *last.lock().unwrap() = l;
+            }
+        });
+    }
+    Ok((child, last_err))
+}
+
+/// Watched side: record `capture`'s raw PCM and send it until the viewer hangs up.
+pub async fn serve_audio(mut w: Writer, mut r: Reader, capture: Vec<String>) -> Result<()> {
+    let (gone_tx, mut gone) = tokio::sync::oneshot::channel::<()>();
+    let _reader = Task::spawn(async move {
+        while r.recv().await.is_ok() {}
+        let _ = gone_tx.send(());
+    });
+    let (mut child, last_err) = spawn_logged(&capture, Stdio::null(), Stdio::piped())?;
+    let mut out = child.stdout.take().context("no stdout")?;
+    let mut buf = vec![0u8; 16384];
+    let mut have = 0;
+    loop {
+        tokio::select! {
+            n = out.read(&mut buf[have..]) => {
+                let n = n?;
+                if n == 0 {
+                    let st = child.wait().await?;
+                    let why = last_err.lock().unwrap().clone();
+                    bail!("sound capture stopped ({st}){}{why}", if why.is_empty() { "" } else { ": " });
+                }
+                have += n;
+                let whole = have - have % AUDIO_FRAME;
+                for c in buf[..whole].chunks(AUDIO_CHUNK) {
+                    w.send(&Msg::ViewData(c.to_vec())).await?;
+                }
+                buf.copy_within(whole..have, 0);
+                have -= whole;
+            }
+            _ = &mut gone => return Ok(()),
+        }
+    }
+}
+
+/// Bytes sitting in a pipe (FIONREAD works on either end).
+fn pipe_queued(fd: i32) -> usize {
+    let mut n: libc::c_int = 0;
+    // SAFETY: FIONREAD writes one int.
+    let r = unsafe { libc::ioctl(fd, libc::FIONREAD, &mut n) };
+    if r < 0 { 0 } else { n.max(0) as usize }
+}
+
+/// What to do with one chunk, given how much the player hasn't read yet.
+fn audio_fits(queued: usize, chunk: usize) -> bool {
+    queued + chunk <= AUDIO_MAX_QUEUED
+}
+
+/// Viewer side: play the sound with `player` (raw PCM on stdin).
+pub async fn play_audio(mut r: Reader, w: Writer, player: Vec<String>) -> Result<()> {
+    let _keep_open = w;
+    let (mut child, last_err) = spawn_logged(&player, Stdio::piped(), Stdio::null())?;
+    let stdin = child.stdin.take().context("no stdin")?;
+    let fd = stdin.as_raw_fd();
+    let mut dropped = 0u64;
+    loop {
+        tokio::select! {
+            m = r.recv() => {
+                let Msg::ViewData(d) = m.context("the other side hung up the sound")? else {
+                    continue;
+                };
+                if d.len() % AUDIO_FRAME != 0 || d.len() > AUDIO_CHUNK {
+                    continue;
+                }
+                if !audio_fits(pipe_queued(fd), d.len()) {
+                    dropped += 1;
+                    if dropped.is_power_of_two() {
+                        log::debug!("view: sound behind, dropped {dropped} chunks so far");
+                    }
+                    continue;
+                }
+                // tokio set the pipe nonblocking; ≤ PIPE_BUF bytes go in whole or not at all.
+                // SAFETY: write from our buffer to the player's stdin pipe.
+                let n = unsafe { libc::write(fd, d.as_ptr().cast(), d.len()) };
+                if n < 0 {
+                    let e = std::io::Error::last_os_error();
+                    if e.kind() != std::io::ErrorKind::WouldBlock {
+                        return Err(e).context("the sound player closed");
+                    }
+                    dropped += 1;
+                }
+            }
+            st = child.wait() => {
+                let why = last_err.lock().unwrap().clone();
+                bail!("the sound player exited ({}){}{why}", st?, if why.is_empty() { "" } else { ": " })
+            }
+        }
+    }
+}
+
+/// Drop `--flag ""` pairs left by an empty placeholder (e.g. no audio_source:
+/// pw-record then records the default output).
+pub fn drop_empty_options(cmd: Vec<String>) -> Vec<String> {
+    let mut out = Vec::with_capacity(cmd.len());
+    let mut it = cmd.into_iter().peekable();
+    while let Some(a) = it.next() {
+        if a.starts_with('-') && a.len() > 1 && it.peek().is_some_and(|n| n.is_empty()) {
+            it.next();
+            continue;
+        }
+        out.push(a);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -393,5 +534,61 @@ mod tests {
         let _link = proto::handshake(s, &psk, true).await.unwrap();
         let err = server.await.unwrap().unwrap_err().to_string();
         assert!(err.contains("no such monitor"), "{err}");
+    }
+
+    #[test]
+    fn audio_queue_bound_and_empty_options() {
+        assert!(audio_fits(0, AUDIO_CHUNK));
+        assert!(audio_fits(AUDIO_MAX_QUEUED - AUDIO_CHUNK, AUDIO_CHUNK));
+        assert!(!audio_fits(AUDIO_MAX_QUEUED - AUDIO_CHUNK + 4, AUDIO_CHUNK));
+        assert_eq!(
+            drop_empty_options(sv(&["pw-record", "--target", "", "-"])),
+            sv(&["pw-record", "-"])
+        );
+        assert_eq!(
+            drop_empty_options(sv(&["pw-record", "--target", "ember_game", "-"])),
+            sv(&["pw-record", "--target", "ember_game", "-"])
+        );
+    }
+
+    /// Sound end to end with stand-ins: whole frames arrive, odd bytes wait.
+    #[tokio::test]
+    async fn sound_reaches_the_player() {
+        let psk = [3u8; 32];
+        let out = std::env::temp_dir().join(format!("edgehop-sound-{}", std::process::id()));
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (s, _) = l.accept().await.unwrap();
+            let (r, w) = proto::handshake(s, &psk, false).await.unwrap();
+            // 4002 bytes: 1000 whole frames + 2 stray bytes that never go out.
+            serve_audio(
+                w,
+                r,
+                sv(&[
+                    "sh",
+                    "-c",
+                    "head -c 4002 /dev/zero | tr '\\0' 'a'; exec sleep 30",
+                ]),
+            )
+            .await
+        });
+        let s = TcpStream::connect(addr).await.unwrap();
+        let (r, w) = proto::handshake(s, &psk, true).await.unwrap();
+        let player = vec!["sh".into(), "-c".into(), format!("cat > {}", out.display())];
+        let viewer = tokio::spawn(play_audio(r, w, player));
+        let len = || std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
+        for _ in 0..100 {
+            if len() >= 4000 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(len(), 4000);
+        viewer.abort();
+        let res = tokio::time::timeout(Duration::from_secs(3), server).await;
+        assert!(matches!(res, Ok(Ok(Ok(())))), "{res:?}");
+        let _ = std::fs::remove_file(&out);
     }
 }
