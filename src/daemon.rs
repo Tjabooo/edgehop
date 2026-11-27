@@ -51,6 +51,14 @@ enum NetEvent {
         peer: String,
         conn: u64,
     },
+    /// A game rumbled our mirror of `peer`'s gamepad `id`.
+    Rumble {
+        peer: String,
+        id: u32,
+        strong: u16,
+        weak: u16,
+        ms: u16,
+    },
 }
 
 struct Control {
@@ -63,6 +71,8 @@ struct LocalDev {
     grab_fd: OwnedFd,
     state: InputState,
     path: PathBuf,
+    /// Gamepads: the effect a peer's game is playing on us right now.
+    rumble: Option<evdev::FFEffect>,
 }
 
 struct Link {
@@ -497,6 +507,7 @@ impl Daemon {
                         grab_fd,
                         state: InputState::new(),
                         path,
+                        rumble: None,
                     },
                 );
             }
@@ -635,10 +646,17 @@ impl Daemon {
                 frac,
             },
         );
-        // Carry an ongoing swipe over to the other side.
+        // Carry an ongoing swipe (or a held stick) over to the other side.
         for (id, d) in &self.devices {
-            if d.desc.touchpad {
-                let resume = d.state.touch_resume(&d.desc.abs);
+            if d.desc.touchpad || d.desc.gamepad {
+                let resume = if d.desc.gamepad {
+                    devices::gamepad_snapshot(&d.grab_fd, &d.desc).unwrap_or_else(|e| {
+                        log::warn!("read {}: {e}", d.desc.name);
+                        Vec::new()
+                    })
+                } else {
+                    d.state.touch_resume(&d.desc.abs)
+                };
                 if !resume.is_empty() {
                     self.send(
                         &peer,
@@ -683,7 +701,10 @@ impl Daemon {
         let Some(mut c) = self.controlling.take() else {
             return;
         };
-        for d in self.devices.values() {
+        for d in self.devices.values_mut() {
+            if let Some(mut fx) = d.rumble.take() {
+                let _ = fx.stop();
+            }
             if let Err(e) = devices::set_grab(&d.grab_fd, false) {
                 log::warn!("ungrab {}: {e}", d.desc.name);
             }
@@ -758,6 +779,27 @@ impl Daemon {
                     self.on_msg(&peer, msg).await;
                 }
             }
+            NetEvent::Rumble {
+                peer,
+                id,
+                strong,
+                weak,
+                ms,
+            } => {
+                // Only while that peer drives us; stops always get through.
+                let driving = self.controlled_by.as_ref().is_some_and(|c| c.peer == peer);
+                if driving || (strong == 0 && weak == 0) {
+                    self.send(
+                        &peer,
+                        Msg::Rumble {
+                            id,
+                            strong,
+                            weak,
+                            ms,
+                        },
+                    );
+                }
+            }
         }
     }
 
@@ -783,7 +825,19 @@ impl Daemon {
             Msg::Hello { .. } | Msg::Ping => {}
             Msg::AddDevice { id, desc } => {
                 let name = desc.name.clone();
-                match Mirror::create(desc) {
+                let sink: Option<crate::mirror::RumbleSink> = desc.rumble.then(|| {
+                    let (net, peer) = (self.net_tx.clone(), peer.to_string());
+                    Box::new(move |strong, weak, ms| {
+                        let _ = net.send(NetEvent::Rumble {
+                            peer: peer.clone(),
+                            id,
+                            strong,
+                            weak,
+                            ms,
+                        });
+                    }) as crate::mirror::RumbleSink
+                });
+                match Mirror::create(desc, sink) {
                     Ok(m) => {
                         log::info!("{peer}: mirrored device {id} {name}");
                         self.mirrors.insert((peer.to_string(), id), m);
@@ -889,7 +943,59 @@ impl Daemon {
                     self.view_broke(&format!("{peer}: {why}"));
                 }
             }
+            Msg::Rumble {
+                id,
+                strong,
+                weak,
+                ms,
+            } => self.play_rumble(peer, id, strong, weak, ms),
             Msg::ViewData(_) => {}
+        }
+    }
+
+    /// Controller: a game on `peer` rumbled our gamepad `id`; play it on the
+    /// real pad (only while we drive `peer`, so a game left running there
+    /// can't buzz the pad in your hands here).
+    fn play_rumble(&mut self, peer: &str, id: u32, strong: u16, weak: u16, ms: u16) {
+        let driving = self.controlling.as_ref().is_some_and(|c| c.peer == peer);
+        let Some(d) = self.devices.get_mut(&id) else {
+            return;
+        };
+        if !d.desc.rumble {
+            return;
+        }
+        if strong == 0 && weak == 0 || !driving {
+            if let Some(fx) = d.rumble.as_mut() {
+                let _ = fx.stop();
+            }
+            return;
+        }
+        let data = evdev::FFEffectData {
+            direction: 0,
+            trigger: evdev::FFTrigger::default(),
+            replay: evdev::FFReplay {
+                length: ms,
+                delay: 0,
+            },
+            kind: evdev::FFEffectKind::Rumble {
+                strong_magnitude: strong,
+                weak_magnitude: weak,
+            },
+        };
+        let res = match d.rumble.as_mut() {
+            Some(fx) => fx.update(data).and_then(|_| fx.play(1)),
+            None => devices::nix_dup(std::os::fd::AsRawFd::as_raw_fd(&d.grab_fd))
+                .and_then(evdev::raw_stream::RawDevice::from_fd)
+                .and_then(|mut dev| dev.upload_ff_effect(data))
+                .and_then(|mut fx| {
+                    fx.play(1)?;
+                    d.rumble = Some(fx);
+                    Ok(())
+                }),
+        };
+        if let Err(e) = res {
+            log::warn!("rumble {}: {e}", d.desc.name);
+            d.rumble = None;
         }
     }
 
@@ -1398,6 +1504,8 @@ mod tests {
             pointer: true,
             touchpad: false,
             keyboard: false,
+            gamepad: false,
+            rumble: false,
         };
         w.send(&Msg::AddDevice { id: 77, desc }).await.unwrap();
         tokio::time::sleep(Duration::from_millis(800)).await;

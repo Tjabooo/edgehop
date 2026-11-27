@@ -126,6 +126,8 @@ async fn check(config_path: &std::path::Path) -> Result<()> {
                     (d.keyboard, "keyboard"),
                     (d.pointer, "mouse"),
                     (d.touchpad, "touchpad"),
+                    (d.gamepad && !d.rumble, "gamepad"),
+                    (d.gamepad && d.rumble, "gamepad+rumble"),
                 ]
                 .iter()
                 .filter(|(on, _)| *on)

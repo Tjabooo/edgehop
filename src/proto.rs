@@ -12,7 +12,7 @@ use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 
 use crate::geometry::Side;
 
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 const NOISE_PARAMS: &str = "Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s";
 const MAX_FRAME: usize = 65535;
 /// Keep plaintext well under the Noise limit (65535 incl. 16-byte tag).
@@ -52,6 +52,12 @@ pub struct DeviceDesc {
     pub pointer: bool,
     pub touchpad: bool,
     pub keyboard: bool,
+    /// Gamepad, joystick or wheel: follows the keyboard and mouse to the
+    /// machine you drive, so its games get the controller.
+    pub gamepad: bool,
+    /// The real device can rumble (FF_RUMBLE): the mirror offers it too and
+    /// sends the effects back.
+    pub rumble: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -87,6 +93,15 @@ pub enum Msg {
     /// The cursor left through the edge facing you, at `frac` along it.
     Released {
         frac: f64,
+    },
+    /// Receiver → controller: a game rumbled the mirror of gamepad `id`.
+    /// Play it on the real one for `ms` (0 = until the next Rumble);
+    /// strong = weak = 0 stops it.
+    Rumble {
+        id: u32,
+        strong: u16,
+        weak: u16,
+        ms: u16,
     },
     // remote view
     /// Receiver → controller: the view key was pressed (on the controller's

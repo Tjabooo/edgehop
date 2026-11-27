@@ -14,6 +14,7 @@ It fills the same gap as Synergy, Barrier, Input Leap or Mouse Without Borders (
 
 - **Edge crossing.** Configure which side each machine sits on. Multi-monitor layouts work; only the outer edges count, not the seams between your own monitors.
 - **Real devices on the other side.** Each captured device is recreated through uinput with the same capabilities, so the far compositor (libinput) handles acceleration, touchpad gestures, keyboard layout and repeat itself. Nothing is re-interpreted on the way.
+- **Gamepads follow you.** Controllers, joysticks and wheels go wherever your keyboard and mouse are, so a game on the other machine sees the pad as its own (same name and USB IDs, so Steam and SDL map it normally). Rumble comes back to the real pad, sticks and triggers let go cleanly when you cross back, and a stick already pushed when you cross is carried over.
 - **Swipes carry over.** A touchpad swipe that crosses the edge keeps going on the other screen.
 - **Encrypted and authenticated.** Noise protocol (`NNpsk0`, ChaCha20-Poly1305, BLAKE2s) with a pre-shared key: only machines holding the key can connect, and keystrokes are never sent in the clear.
 - **One link, both directions.** Only one machine has to accept connections, so a firewalled desktop can dial out to a laptop.
@@ -143,6 +144,12 @@ hint = "Super+Alt+L"  # named in the notifications
 
 `capture` and `player` override the commands; see `config.example.toml` for the placeholders. A stream that breaks (recorder missing, monitor gone) shows a notification saying why, and remote view stays on for the next crossing.
 
+### Gamepads
+
+Nothing to configure: `edgehop check` lists them as `gamepad` (or `gamepad+rumble`), and `ignore_devices` keeps one at home. While you drive another machine, the pad is grabbed like the keyboard, so games on the local machine stop seeing it. The mirror on the far side exists as long as the link is up; it just sits idle while you're home.
+
+Rumble: the mirror offers `FF_RUMBLE`. When a game there plays an effect, edgehop sends its strength and length back and plays it on the real pad, only while you're driving that machine. Other force-feedback effects (wheel springs, periodic waves) aren't forwarded.
+
 ## Usage
 
 ```
@@ -188,6 +195,7 @@ Devices are announced when the link comes up (and on hotplug), so the copies alr
 - Hyprland only for now: the cursor and layout queries go through its IPC. Capture and injection are compositor-independent, so other compositors need only a small adapter.
 - Clipboard sharing isn't built in.
 - Remote view is video only (no sound) and needs both machines on the same protocol version (0.2+).
+- Gamepads need protocol 3 (0.3+) on both machines. Motion sensors (DualSense/DualShock gyro) and controller LEDs aren't forwarded.
 - A fullscreen game that locks the pointer can't be left through the edge; use the release keys or the `switch` bind.
 
 ## License

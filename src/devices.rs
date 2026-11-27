@@ -6,7 +6,9 @@ use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use evdev::{AbsoluteAxisCode as Abs, EventType, KeyCode, PropType, RelativeAxisCode as Rel};
+use evdev::{
+    AbsoluteAxisCode as Abs, EventType, FFEffectCode, KeyCode, PropType, RelativeAxisCode as Rel,
+};
 use tokio::sync::mpsc;
 
 use crate::proto::{AbsAxis, DeviceDesc, Ev};
@@ -107,9 +109,17 @@ pub fn describe(
         .is_some_and(|a| a.contains(Abs::ABS_MT_POSITION_X) && a.contains(Abs::ABS_X))
         && (has_key(KeyCode::BTN_TOUCH) || has_key(KeyCode::BTN_TOOL_FINGER))
         && !props.contains(PropType::DIRECT);
-    if !(keyboard || pointer || touchpad) {
-        return Err("not a keyboard, mouse or touchpad");
+    // BTN_SOUTH = BTN_GAMEPAD (pads), BTN_TRIGGER = BTN_JOYSTICK (sticks, wheels).
+    let gamepad = !(keyboard || pointer || touchpad)
+        && (has_key(KeyCode::BTN_SOUTH) || has_key(KeyCode::BTN_TRIGGER));
+    if !(keyboard || pointer || touchpad || gamepad) {
+        return Err("not a keyboard, mouse, touchpad or gamepad");
     }
+    let rumble = gamepad
+        && dev.supported_events().contains(EventType::FORCEFEEDBACK)
+        && dev
+            .supported_ff()
+            .is_some_and(|f| f.contains(FFEffectCode::FF_RUMBLE));
 
     let abs_state = dev.get_abs_state().map_err(|_| "could not read axes")?;
     let mut abs_axes = Vec::new();
@@ -157,6 +167,8 @@ pub fn describe(
         pointer,
         touchpad,
         keyboard,
+        gamepad,
+        rumble,
     })
 }
 
@@ -228,18 +240,8 @@ pub fn resync_touchpad(
     caps: &[u16],
     abs: &[AbsAxis],
 ) -> std::io::Result<()> {
-    // EVIOCGKEY(len) = _IOR('E', 0x18, len)
-    let mut bits = [0u8; 96];
-    let req: libc::c_ulong = (2 << 30) | ((bits.len() as libc::c_ulong) << 16) | (0x45 << 8) | 0x18;
-    // SAFETY: the kernel writes at most bits.len() bytes into our buffer.
-    let r = unsafe { libc::ioctl(fd.as_raw_fd(), req as _, bits.as_mut_ptr()) };
-    if r < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    let held = |c: u16| {
-        bits.get(c as usize / 8)
-            .is_some_and(|b| b >> (c % 8) & 1 == 1)
-    };
+    let bits = held_keys(fd)?;
+    let held = |c: u16| bit(&bits, c);
     let mut frame = touch_resync_frame(caps, held);
     // Per-slot tool types have the same problem: a palm the hardware reported
     // (and took back) during the grab stays a palm in libinput forever, which
@@ -309,6 +311,75 @@ pub fn tool_type_resync(current: i32, types: &[i32]) -> Vec<Ev> {
         });
     }
     out
+}
+
+/// EVIOCGKEY(len) = _IOR('E', 0x18, len): the keys/buttons held right now.
+fn held_keys(fd: &OwnedFd) -> std::io::Result<[u8; 96]> {
+    let mut bits = [0u8; 96];
+    let req: libc::c_ulong = (2 << 30) | ((bits.len() as libc::c_ulong) << 16) | (0x45 << 8) | 0x18;
+    // SAFETY: the kernel writes at most bits.len() bytes into our buffer.
+    let r = unsafe { libc::ioctl(fd.as_raw_fd(), req as _, bits.as_mut_ptr()) };
+    if r < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(bits)
+}
+
+fn bit(bits: &[u8], c: u16) -> bool {
+    bits.get(c as usize / 8)
+        .is_some_and(|b| b >> (c % 8) & 1 == 1)
+}
+
+/// A gamepad's whole current state (every axis, every held button), sent on
+/// handover so the mirror starts where the real pad is (a stick already
+/// pushed, a trigger already held).
+pub fn gamepad_snapshot(fd: &OwnedFd, desc: &DeviceDesc) -> std::io::Result<Vec<Ev>> {
+    let bits = held_keys(fd)?;
+    let mut out = Vec::new();
+    for a in &desc.abs {
+        out.push(Ev {
+            t: EV_ABS,
+            c: a.code,
+            v: read_abs_value(fd, a.code)?,
+        });
+    }
+    for &k in &desc.keys {
+        if bit(&bits, k) {
+            out.push(Ev {
+                t: EV_KEY,
+                c: k,
+                v: 1,
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// Where an axis sits when nobody touches it: hats and sticks in the middle,
+/// triggers (and pedals) at their minimum.
+pub fn axis_rest(a: &AbsAxis, abs: &[AbsAxis]) -> i32 {
+    const ABS_Z: u16 = 0x02;
+    const ABS_RX: u16 = 0x03;
+    const ABS_RZ: u16 = 0x05;
+    const ABS_THROTTLE: u16 = 0x06;
+    const ABS_GAS: u16 = 0x09;
+    const ABS_BRAKE: u16 = 0x0a;
+    let has = |c: u16| abs.iter().any(|x| x.code == c);
+    let trigger = match a.code {
+        ABS_GAS | ABS_BRAKE | ABS_THROTTLE => true,
+        // Pads with a right stick on RX/RY put their triggers on Z/RZ
+        // (xpad, hid-playstation); without it, Z/RZ are the right stick.
+        ABS_Z | ABS_RZ => has(ABS_RX),
+        _ => false,
+    };
+    if trigger && a.min >= 0 {
+        return a.min;
+    }
+    if a.min < 0 && a.max > 0 {
+        0
+    } else {
+        a.min + (a.max - a.min + 1) / 2
+    }
 }
 
 /// EVIOCGABS(code) = _IOR('E', 0x40 + code, struct input_absinfo)
@@ -449,7 +520,7 @@ pub async fn manager(ignore: Vec<String>, tx: mpsc::Sender<DevEvent>) {
     }
 }
 
-fn nix_dup(fd: i32) -> std::io::Result<OwnedFd> {
+pub fn nix_dup(fd: i32) -> std::io::Result<OwnedFd> {
     use std::os::fd::FromRawFd;
     // SAFETY: F_DUPFD_CLOEXEC returns a new fd we then own.
     let n = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
@@ -786,6 +857,44 @@ mod tests {
         assert_eq!(f[3], k(0x145, 1));
         assert_eq!(f[5], k(0x14d, 0));
         assert!(touch_resync_frame(&[0x110], |_| false).is_empty());
+    }
+
+    fn axis(code: u16, min: i32, max: i32) -> AbsAxis {
+        AbsAxis {
+            code,
+            min,
+            max,
+            fuzz: 0,
+            flat: 0,
+            res: 0,
+        }
+    }
+
+    #[test]
+    fn gamepad_axes_rest_in_the_middle_triggers_at_zero() {
+        // xpad: sticks X/Y/RX/RY ±32k, triggers Z/RZ 0..1023, d-pad hats ±1.
+        let xbox = [
+            axis(0x00, -32768, 32767),
+            axis(0x01, -32768, 32767),
+            axis(0x02, 0, 1023),
+            axis(0x03, -32768, 32767),
+            axis(0x04, -32768, 32767),
+            axis(0x05, 0, 1023),
+            axis(0x10, -1, 1),
+        ];
+        let rest: Vec<i32> = xbox.iter().map(|a| axis_rest(a, &xbox)).collect();
+        assert_eq!(rest, [0, 0, 0, 0, 0, 0, 0]);
+        // Generic HID pad: 0..255 sticks with the right stick on Z/RZ,
+        // triggers on GAS/BRAKE.
+        let generic = [
+            axis(0x00, 0, 255),
+            axis(0x02, 0, 255),
+            axis(0x05, 0, 255),
+            axis(0x09, 0, 255),
+            axis(0x0a, 0, 255),
+        ];
+        let rest: Vec<i32> = generic.iter().map(|a| axis_rest(a, &generic)).collect();
+        assert_eq!(rest, [128, 128, 128, 0, 0]);
     }
 
     #[test]
