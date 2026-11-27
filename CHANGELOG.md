@@ -4,6 +4,7 @@ All notable changes to this project are listed here ([Keep a Changelog](https://
 
 ## [Unreleased]
 
+- Fix touchpads becoming unresponsive after a handover by restoring per-finger tool type and other touch attributes, including inactive slots.
 - Remote view: `edgehop view` (bind it to a key) shows the screen of the machine you drive, full screen, following its cursor across monitors. It opens on every crossing while on, over a separate encrypted video link (`[view]` config).
 - Protocol version 2: update every machine together.
 

@@ -1,7 +1,7 @@
 //! Local input devices: find keyboards, mice and touchpads, read them
 //! passively, and grab them (EVIOCGRAB) while another machine is controlled.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -436,14 +436,27 @@ const ABS_MT_SLOT: u16 = 0x2f;
 const ABS_MT_POSITION_X: u16 = 0x35;
 const ABS_MT_POSITION_Y: u16 = 0x36;
 const ABS_MT_TRACKING_ID: u16 = 0x39;
+const ABS_MT_TOOL_Y: u16 = 0x3d;
 const BTN_TOUCH: u16 = 0x14a;
 const BTN_TOOL_FINGER: u16 = 0x145;
 
-#[derive(Default, Clone, Copy)]
+#[derive(Clone)]
 struct Slot {
     tracking: i32,
     x: i32,
     y: i32,
+    axes: BTreeMap<u16, i32>,
+}
+
+impl Default for Slot {
+    fn default() -> Self {
+        Self {
+            tracking: -1,
+            x: 0,
+            y: 0,
+            axes: BTreeMap::new(),
+        }
+    }
 }
 
 /// Tracks held keys and touches of one device, from its event stream.
@@ -491,25 +504,21 @@ impl InputState {
                     ABS_X => self.abs_x = Some(e.v),
                     ABS_Y => self.abs_y = Some(e.v),
                     ABS_MT_SLOT => self.slot = e.v.max(0) as usize,
-                    ABS_MT_TRACKING_ID | ABS_MT_POSITION_X | ABS_MT_POSITION_Y => {
+                    c if (ABS_MT_SLOT + 1..=ABS_MT_TOOL_Y).contains(&c) => {
                         if self.slot >= self.slots.len() {
                             if self.slot > 64 {
                                 continue;
                             }
-                            self.slots.resize(
-                                self.slot + 1,
-                                Slot {
-                                    tracking: -1,
-                                    x: 0,
-                                    y: 0,
-                                },
-                            );
+                            self.slots.resize_with(self.slot + 1, Slot::default);
                         }
                         let s = &mut self.slots[self.slot];
                         match e.c {
                             ABS_MT_TRACKING_ID => s.tracking = e.v,
                             ABS_MT_POSITION_X => s.x = e.v,
-                            _ => s.y = e.v,
+                            ABS_MT_POSITION_Y => s.y = e.v,
+                            _ => {
+                                s.axes.insert(e.c, e.v);
+                            }
                         }
                     }
                     _ => {}
@@ -537,40 +546,39 @@ impl InputState {
         self.keys.iter().any(|k| !is_touch_tool(*k))
     }
 
-    /// Events that recreate the current touches on a fresh device, so a
-    /// swipe that crosses over keeps going on the other side.
-    pub fn touch_resume(&self) -> Vec<Ev> {
+    /// Restore every slot's attributes as well as ongoing touches. The mirror
+    /// persists between handovers, while evdev only reports changes: a tool
+    /// changing from palm to finger locally must reach even an inactive slot,
+    /// or libinput will reject its next touch as a palm indefinitely.
+    pub fn touch_resume(&self, caps: &[AbsAxis]) -> Vec<Ev> {
         let mut out = Vec::new();
-        let active: Vec<(usize, &Slot)> = self
-            .slots
-            .iter()
-            .enumerate()
-            .filter(|(_, s)| s.tracking >= 0)
-            .collect();
-        if active.is_empty() {
+        let Some(slot_axis) = caps.iter().find(|a| a.code == ABS_MT_SLOT) else {
             return out;
-        }
-        for (i, s) in &active {
+        };
+        for i in 0..=slot_axis.max.clamp(0, 64) as usize {
+            let empty = Slot::default();
+            let s = self.slots.get(i).unwrap_or(&empty);
             out.push(Ev {
                 t: EV_ABS,
                 c: ABS_MT_SLOT,
-                v: *i as i32,
+                v: i as i32,
             });
-            out.push(Ev {
-                t: EV_ABS,
-                c: ABS_MT_TRACKING_ID,
-                v: s.tracking,
-            });
-            out.push(Ev {
-                t: EV_ABS,
-                c: ABS_MT_POSITION_X,
-                v: s.x,
-            });
-            out.push(Ev {
-                t: EV_ABS,
-                c: ABS_MT_POSITION_Y,
-                v: s.y,
-            });
+            for a in caps
+                .iter()
+                .filter(|a| (ABS_MT_SLOT + 1..=ABS_MT_TOOL_Y).contains(&a.code))
+            {
+                let v = match a.code {
+                    ABS_MT_TRACKING_ID => s.tracking,
+                    ABS_MT_POSITION_X => s.x,
+                    ABS_MT_POSITION_Y => s.y,
+                    c => s.axes.get(&c).copied().unwrap_or(0),
+                };
+                out.push(Ev {
+                    t: EV_ABS,
+                    c: a.code,
+                    v,
+                });
+            }
         }
         out.push(Ev {
             t: EV_ABS,
@@ -652,6 +660,26 @@ mod tests {
         Ev { t: EV_ABS, c, v }
     }
 
+    fn touch_caps(extra: &[u16]) -> Vec<AbsAxis> {
+        [
+            ABS_MT_SLOT,
+            ABS_MT_POSITION_X,
+            ABS_MT_POSITION_Y,
+            ABS_MT_TRACKING_ID,
+        ]
+        .into_iter()
+        .chain(extra.iter().copied())
+        .map(|code| AbsAxis {
+            code,
+            min: 0,
+            max: if code == ABS_MT_SLOT { 1 } else { 65535 },
+            fuzz: 0,
+            flat: 0,
+            res: 0,
+        })
+        .collect()
+    }
+
     #[test]
     fn resync_frame_ends_on_real_state() {
         let caps = [0x110, 0x14a, 0x145, 0x14d];
@@ -707,13 +735,67 @@ mod tests {
         );
         let (dx, _) = s.apply(&[a(ABS_MT_POSITION_X, 480), a(ABS_X, 480)]);
         assert_eq!(dx, -20.0);
-        let resume = s.touch_resume();
+        let caps = touch_caps(&[]);
+        let resume = s.touch_resume(&caps);
         assert!(resume.contains(&a(ABS_MT_TRACKING_ID, 42)));
         assert!(resume.contains(&a(ABS_MT_POSITION_X, 480)));
         assert!(resume.contains(&k(BTN_TOUCH, 1)));
         let lift = s.release_all();
         assert!(lift.contains(&a(ABS_MT_TRACKING_ID, -1)));
         assert!(lift.contains(&k(BTN_TOOL_FINGER, 0)));
-        assert!(s.touch_resume().is_empty());
+        let mut resumed = InputState::new();
+        resumed.apply(&s.touch_resume(&caps));
+        assert!(resumed.slots.iter().all(|s| s.tracking == -1));
+        assert!(resumed.keys.is_empty());
+    }
+
+    #[test]
+    fn handover_restores_inactive_palm_slot_before_next_finger() {
+        const TOOL: u16 = 0x37;
+        let caps = touch_caps(&[TOOL]);
+        let mut local = InputState::new();
+        let mut remote = InputState::new();
+        // A palm was seen remotely, then lifted. Slot attributes persist.
+        let palm = [a(ABS_MT_SLOT, 0), a(TOOL, 2), a(ABS_MT_TRACKING_ID, 42)];
+        local.apply(&palm);
+        remote.apply(&palm);
+        remote.release_all();
+        // The palm-to-finger transition happens while input stays local.
+        local.apply(&[a(ABS_MT_TRACKING_ID, -1), a(TOOL, 0)]);
+        // Switch with no finger down. The next contact won't repeat TOOL=0.
+        remote.apply(&local.touch_resume(&caps));
+        remote.apply(&[a(ABS_MT_TRACKING_ID, 43)]);
+        assert_eq!(remote.slots[0].axes[&TOOL], 0);
+        assert_eq!(remote.slots[0].tracking, 43);
+    }
+
+    #[test]
+    fn handover_restores_each_slots_attributes_and_current_slot() {
+        const TOOL: u16 = 0x37;
+        const PRESSURE: u16 = 0x3a;
+        let caps = touch_caps(&[TOOL, PRESSURE]);
+        let mut local = InputState::new();
+        local.apply(&[
+            a(ABS_MT_SLOT, 0),
+            a(TOOL, 2),
+            a(PRESSURE, 11),
+            a(ABS_MT_SLOT, 1),
+            a(TOOL, 0),
+            a(PRESSURE, 25),
+            a(ABS_MT_TRACKING_ID, 7),
+        ]);
+        let mut remote = InputState::new();
+        remote.apply(&local.touch_resume(&caps));
+        assert_eq!(remote.slot, 1);
+        assert_eq!(remote.slots[0].tracking, -1);
+        assert_eq!(remote.slots[0].axes[&TOOL], 2);
+        assert_eq!(remote.slots[0].axes[&PRESSURE], 11);
+        assert_eq!(remote.slots[1].axes[&TOOL], 0);
+        assert_eq!(remote.slots[1].axes[&PRESSURE], 25);
+        assert_eq!(remote.slots[1].tracking, 7);
+
+        let resume = local.touch_resume(&touch_caps(&[]));
+        assert!(!resume.iter().any(|e| e.c == TOOL || e.c == PRESSURE));
+        assert!(local.touch_resume(&[]).is_empty());
     }
 }

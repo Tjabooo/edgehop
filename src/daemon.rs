@@ -638,7 +638,7 @@ impl Daemon {
         // Carry an ongoing swipe over to the other side.
         for (id, d) in &self.devices {
             if d.desc.touchpad {
-                let resume = d.state.touch_resume();
+                let resume = d.state.touch_resume(&d.desc.abs);
                 if !resume.is_empty() {
                     self.send(
                         &peer,
