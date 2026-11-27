@@ -222,7 +222,12 @@ pub fn touch_resync_frame(caps: &[u16], held: impl Fn(u16) -> bool) -> Vec<Ev> {
 /// state from when the grab began: it never saw the finger-count changes in
 /// between, and ends up with an impossible state ("Invalid fake finger
 /// state") that breaks multi-finger gestures. Re-send the real state.
-pub fn resync_touchpad(path: &Path, fd: &OwnedFd, caps: &[u16]) -> std::io::Result<()> {
+pub fn resync_touchpad(
+    path: &Path,
+    fd: &OwnedFd,
+    caps: &[u16],
+    abs: &[AbsAxis],
+) -> std::io::Result<()> {
     // EVIOCGKEY(len) = _IOR('E', 0x18, len)
     let mut bits = [0u8; 96];
     let req: libc::c_ulong = (2 << 30) | ((bits.len() as libc::c_ulong) << 16) | (0x45 << 8) | 0x18;
@@ -235,7 +240,23 @@ pub fn resync_touchpad(path: &Path, fd: &OwnedFd, caps: &[u16]) -> std::io::Resu
         bits.get(c as usize / 8)
             .is_some_and(|b| b >> (c % 8) & 1 == 1)
     };
-    let frame = touch_resync_frame(caps, held);
+    let mut frame = touch_resync_frame(caps, held);
+    // Per-slot tool types have the same problem: a palm the hardware reported
+    // (and took back) during the grab stays a palm in libinput forever, which
+    // silently kills two-finger scrolling. Walk each slot's type the same way.
+    let tool_types = abs.iter().any(|a| a.code == ABS_MT_TOOL_TYPE);
+    if let (true, Some(slot_axis)) = (tool_types, abs.iter().find(|a| a.code == ABS_MT_SLOT)) {
+        let n = (slot_axis.max.max(0) as usize + 1).min(64);
+        let current = read_abs_value(fd, ABS_MT_SLOT)?;
+        let types = read_mt_slots(fd, ABS_MT_TOOL_TYPE, n)?;
+        let syn = frame.pop();
+        frame.extend(tool_type_resync(current, &types));
+        frame.push(syn.unwrap_or(Ev {
+            t: EV_SYN,
+            c: SYN_REPORT,
+            v: 0,
+        }));
+    }
     if frame.is_empty() {
         return Ok(());
     }
@@ -260,6 +281,60 @@ pub fn resync_touchpad(path: &Path, fd: &OwnedFd, caps: &[u16]) -> std::io::Resu
         .write(true)
         .open(path)?
         .write_all(&raw)
+}
+
+/// Events that flip every slot's ABS_MT_TOOL_TYPE away from its real value
+/// and back, then return to the kernel's current slot.
+pub fn tool_type_resync(current: i32, types: &[i32]) -> Vec<Ev> {
+    let mut out = Vec::new();
+    for (slot, &real) in types.iter().enumerate() {
+        out.push(Ev {
+            t: EV_ABS,
+            c: ABS_MT_SLOT,
+            v: slot as i32,
+        });
+        for v in [if real == 0 { 1 } else { 0 }, real] {
+            out.push(Ev {
+                t: EV_ABS,
+                c: ABS_MT_TOOL_TYPE,
+                v,
+            });
+        }
+    }
+    if !out.is_empty() {
+        out.push(Ev {
+            t: EV_ABS,
+            c: ABS_MT_SLOT,
+            v: current.max(0),
+        });
+    }
+    out
+}
+
+/// EVIOCGABS(code) = _IOR('E', 0x40 + code, struct input_absinfo)
+fn read_abs_value(fd: &OwnedFd, code: u16) -> std::io::Result<i32> {
+    let mut info = [0i32; 6];
+    let req: libc::c_ulong = (2 << 30) | (24 << 16) | (0x45 << 8) | (0x40 + code as libc::c_ulong);
+    // SAFETY: the kernel fills one input_absinfo (6 x i32).
+    let r = unsafe { libc::ioctl(fd.as_raw_fd(), req as _, info.as_mut_ptr()) };
+    if r < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(info[0])
+}
+
+/// EVIOCGMTSLOTS(len) = _IOR('E', 0x0a, len): buf[0] = code, then one value per slot.
+fn read_mt_slots(fd: &OwnedFd, code: u16, n: usize) -> std::io::Result<Vec<i32>> {
+    let mut buf = vec![0i32; n + 1];
+    buf[0] = code as i32;
+    let len = (buf.len() * 4) as libc::c_ulong;
+    let req: libc::c_ulong = (2 << 30) | (len << 16) | (0x45 << 8) | 0x0a;
+    // SAFETY: the kernel writes at most len bytes into buf.
+    let r = unsafe { libc::ioctl(fd.as_raw_fd(), req as _, buf.as_mut_ptr()) };
+    if r < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(buf[1..].to_vec())
 }
 
 /// EVIOCGRAB = _IOW('E', 0x90, int)
@@ -434,6 +509,7 @@ const ABS_X: u16 = 0x00;
 const ABS_Y: u16 = 0x01;
 const ABS_MT_SLOT: u16 = 0x2f;
 const ABS_MT_POSITION_X: u16 = 0x35;
+const ABS_MT_TOOL_TYPE: u16 = 0x37;
 const ABS_MT_POSITION_Y: u16 = 0x36;
 const ABS_MT_TRACKING_ID: u16 = 0x39;
 const ABS_MT_TOOL_Y: u16 = 0x3d;
@@ -678,6 +754,27 @@ mod tests {
             res: 0,
         })
         .collect()
+    }
+
+    #[test]
+    fn tool_type_resync_ends_on_real_types_and_slot() {
+        let f = tool_type_resync(1, &[0, 2]);
+        let last_type = |slot: i32| {
+            let mut cur = -1;
+            let mut v = None;
+            for e in &f {
+                if e.c == ABS_MT_SLOT {
+                    cur = e.v;
+                } else if e.c == ABS_MT_TOOL_TYPE && cur == slot {
+                    v = Some(e.v);
+                }
+            }
+            v
+        };
+        assert_eq!(last_type(0), Some(0));
+        assert_eq!(last_type(1), Some(2));
+        assert_eq!(f.last().map(|e| (e.c, e.v)), Some((ABS_MT_SLOT, 1)));
+        assert!(tool_type_resync(0, &[]).is_empty());
     }
 
     #[test]

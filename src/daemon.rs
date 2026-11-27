@@ -688,7 +688,8 @@ impl Daemon {
                 log::warn!("ungrab {}: {e}", d.desc.name);
             }
             if d.desc.touchpad
-                && let Err(e) = devices::resync_touchpad(&d.path, &d.grab_fd, &d.desc.keys)
+                && let Err(e) =
+                    devices::resync_touchpad(&d.path, &d.grab_fd, &d.desc.keys, &d.desc.abs)
             {
                 log::warn!("resync {}: {e}", d.desc.name);
             }
