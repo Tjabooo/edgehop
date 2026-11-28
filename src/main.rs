@@ -6,6 +6,7 @@ mod hypr;
 mod mirror;
 mod notify;
 mod proto;
+mod quality;
 mod view;
 
 use std::path::PathBuf;
@@ -22,6 +23,8 @@ usage:
   edgehop status                     what the running daemon is doing
   edgehop switch [PEER]              jump to a peer now (or back home); bind it to a key
   edgehop view [on|off]              remote view: see the screen of the machine you drive; bind it to a key
+  edgehop view quality [NAME]        quality when this machine is watched: full, medium, low, potato
+  edgehop view pick                  choose that quality in a rofi menu (opens by itself when you switch view on)
   edgehop toggle | enable | disable  switch edge crossing on/off
   edgehop release                    take local input back right now
 
@@ -79,11 +82,64 @@ fn main() -> Result<()> {
         "status" | "toggle" | "enable" | "disable" | "on" | "off" | "release" => {
             rt.block_on(control(cmd))
         }
+        "view" if args.get(1).map(String::as_str) == Some("pick") => rt.block_on(pick_quality()),
         "switch" | "view" => rt.block_on(control(&args.join(" "))),
         _ => {
             eprintln!("{USAGE}");
             bail!("unknown command {cmd:?}")
         }
+    }
+}
+
+/// `edgehop view pick`: a rofi menu of the quality presets.
+async fn pick_quality() -> Result<()> {
+    let current = quality::load();
+    let lines: Vec<String> = quality::QUALITIES
+        .iter()
+        .map(|q| {
+            let mark = if q.name == current.name {
+                "● "
+            } else {
+                "   "
+            };
+            format!("{mark}{}", q.label)
+        })
+        .collect();
+    let row = quality::QUALITIES
+        .iter()
+        .position(|q| q.name == current.name)
+        .unwrap_or(0);
+    let mut child = tokio::process::Command::new("rofi")
+        .args([
+            "-dmenu",
+            "-i",
+            "-no-custom",
+            "-format",
+            "i",
+            "-p",
+            "View quality",
+        ])
+        .args([
+            "-mesg",
+            "Lower it on a slow connection. Esc keeps the current one.",
+        ])
+        .args(["-selected-row", &row.to_string()])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .context("can't run rofi")?;
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(lines.join("\n").as_bytes()).await?;
+    drop(stdin);
+    let out = child.wait_with_output().await?;
+    let picked = String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse::<usize>()
+        .ok()
+        .and_then(|i| quality::QUALITIES.get(i));
+    match picked {
+        Some(q) => control(&format!("view quality {}", q.name)).await,
+        None => Ok(()),
     }
 }
 

@@ -204,13 +204,12 @@ async fn recv_packet(fd: &tokio::io::unix::AsyncFd<OwnedFd>, buf: &mut [u8]) -> 
     }
 }
 
-/// Watched side: capture the output named in `monitor` (restarting when it
-/// changes) and send it down the link until the viewer hangs up.
+/// Watched side: capture the output named in `feed` with its command
+/// (restarting when either changes) and send it down the link until the viewer hangs up.
 pub async fn serve(
     mut w: Writer,
     mut r: Reader,
-    capture: Vec<String>,
-    mut monitor: watch::Receiver<String>,
+    mut feed: watch::Receiver<(String, Vec<String>)>,
 ) -> Result<()> {
     // The viewer never sends anything here: a finished read means it's gone.
     let (gone_tx, mut gone) = tokio::sync::oneshot::channel::<()>();
@@ -220,7 +219,7 @@ pub async fn serve(
     });
     let mut buf = vec![0u8; 4 << 20];
     loop {
-        let mon = monitor.borrow_and_update().clone();
+        let (mon, capture) = feed.borrow_and_update().clone();
         // A socket can't be reopened through /dev/stdout; ffmpeg's pipe:1 writes fd 1.
         let cmd: Vec<String> = crate::config::fill(&capture, &[("monitor", &mon)])
             .into_iter()
@@ -262,7 +261,7 @@ pub async fn serve(
                         w.send(&Msg::ViewData(piece)).await?;
                     }
                 }
-                ch = monitor.changed() => {
+                ch = feed.changed() => {
                     if ch.is_err() {
                         return Ok(());
                     }
@@ -448,12 +447,12 @@ mod tests {
         let out = std::env::temp_dir().join(format!("edgehop-view-{}", std::process::id()));
         let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = l.local_addr().unwrap();
-        let (mon_tx, mon_rx) = watch::channel("DP-1".to_string());
+        let capture = sv(&["sh", "-c", "printf '<{monitor}>'; exec sleep 30"]);
+        let (mon_tx, mon_rx) = watch::channel(("DP-1".to_string(), capture));
         let server = tokio::spawn(async move {
             let (s, _) = l.accept().await.unwrap();
             let (r, w) = proto::handshake(s, &psk, false).await.unwrap();
-            let capture = sv(&["sh", "-c", "printf '<{monitor}>'; exec sleep 30"]);
-            serve(w, r, capture, mon_rx).await
+            serve(w, r, mon_rx).await
         });
         let s = TcpStream::connect(addr).await.unwrap();
         let (r, w) = proto::handshake(s, &psk, true).await.unwrap();
@@ -466,14 +465,22 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        mon_tx.send_replace("HDMI-A-1".into());
+        mon_tx.send_modify(|f| f.0 = "HDMI-A-1".into());
         for _ in 0..100 {
             if read().contains("<HDMI-A-1>") {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        assert_eq!(read(), "<DP-1><HDMI-A-1>");
+        // A new quality preset swaps the command: the recorder restarts too.
+        mon_tx.send_modify(|f| f.1 = sv(&["sh", "-c", "printf '[{monitor}]'; exec sleep 30"]));
+        for _ in 0..100 {
+            if read().contains("[HDMI-A-1]") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(read(), "<DP-1><HDMI-A-1>[HDMI-A-1]");
         viewer.abort();
         // The viewer hanging up ends the serving side cleanly.
         let res = tokio::time::timeout(Duration::from_secs(3), server).await;
@@ -523,12 +530,12 @@ mod tests {
         let psk = [9u8; 32];
         let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = l.local_addr().unwrap();
-        let (_tx, mon_rx) = watch::channel("DP-1".to_string());
+        let capture = sv(&["sh", "-c", "echo 'gsr error: no such monitor' >&2; exit 3"]);
+        let (_tx, mon_rx) = watch::channel(("DP-1".to_string(), capture));
         let server = tokio::spawn(async move {
             let (s, _) = l.accept().await.unwrap();
             let (r, w) = proto::handshake(s, &psk, false).await.unwrap();
-            let capture = sv(&["sh", "-c", "echo 'gsr error: no such monitor' >&2; exit 3"]);
-            serve(w, r, capture, mon_rx).await
+            serve(w, r, mon_rx).await
         });
         let s = TcpStream::connect(addr).await.unwrap();
         let _link = proto::handshake(s, &psk, true).await.unwrap();

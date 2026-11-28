@@ -74,6 +74,9 @@ pub struct ViewConfig {
     pub audio_capture: Vec<String>,
     /// Command playing that PCM from stdin. Placeholders: {peer}.
     pub audio_player: Vec<String>,
+    /// When the view key is pressed while you drive this machine, show a
+    /// quality picker (rofi) here, i.e. inside the stream. See quality.rs.
+    pub ask_quality: bool,
 }
 
 impl Default for ViewConfig {
@@ -81,6 +84,7 @@ impl Default for ViewConfig {
         let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         ViewConfig {
             on: false,
+            ask_quality: true,
             fps: 0,
             bitrate_kbps: 20000,
             codec: "h264".into(),

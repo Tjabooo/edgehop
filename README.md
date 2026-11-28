@@ -129,6 +129,7 @@ When you drive a machine whose screens you can't see (a desktop in another room,
 
 - It streams the monitor the cursor is on, full screen. Move the cursor to another monitor and the view switches to it (about 0.15 s).
 - The setting stays on: every crossing opens the view, coming back closes it. `edgehop view` (or `view on` / `view off`) changes it, also while you're over there.
+- Slow connection (a phone hotspot)? Pick a quality preset: **full**, **medium** (1080p, 60 fps, 8 Mb/s), **low** (720p, 30 fps, 3 Mb/s, no sound) or **potato** (540p, 24 fps, 1 Mb/s, no sound). The watched machine encodes, so it applies the preset: when you switch the view on while driving it, a rofi picker opens on its screen, right inside the stream (`ask_quality = false` turns that off). Change it later with `edgehop view pick` (bind it next to `edgehop view`) or `edgehop view quality NAME`; a running stream switches at once and the choice is remembered.
 - Sound comes along: the watched machine records an output with `pw-record` (the default one, or a game-only sink via `audio_source`) and sends raw 48 kHz PCM over a third link; the viewer plays it with `pw-play`, keeping at most 40 ms queued (it skips a sliver rather than drifting behind after a hiccup). If sound fails, the picture carries on.
 - The watched machine encodes with `gpu-screen-recorder` (hardware H.264/HEVC, cursor included) and sends a raw stream over a second Noise link, dialed the same way as the main one. The viewer pipes it into `mpv` tuned for low latency (`--untimed`, no cache).
 
@@ -161,6 +162,8 @@ edgehop check                      devices, permissions, screen layout
 edgehop status                     what the running daemon is doing
 edgehop switch [PEER]              jump to a peer now (or back home)
 edgehop view [on|off]              remote view: see the screen of the machine you drive
+edgehop view quality [NAME]        quality when this machine is watched: full, medium, low, potato
+edgehop view pick                  choose that quality in a rofi menu
 edgehop toggle | enable | disable  switch edge crossing on/off
 edgehop release                    take local input back right now
 edgehop keygen                     print a fresh key for `psk`

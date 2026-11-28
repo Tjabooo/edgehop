@@ -4,6 +4,7 @@ All notable changes to this project are listed here ([Keep a Changelog](https://
 
 ## [Unreleased]
 
+- Remote view quality presets for slow links: full, medium, low, potato (lower resolution, frame rate and bitrate; low and potato skip sound). Applied by the watched machine, so no protocol change. A rofi picker opens there when you switch the view on while driving it (`[view] ask_quality`); `edgehop view pick` / `edgehop view quality NAME` change it mid-stream, and the choice is remembered.
 - Remote view sound: the watched machine's output (or one sink, `audio_source`) plays on the viewer over its own link, at most 40 ms queued. `[view] audio`, `audio_capture`, `audio_player`.
 - Protocol version 4: update every machine together.
 - Gamepads: controllers, joysticks and wheels follow the keyboard and mouse to the machine you drive, with rumble played back on the real pad. Sticks and triggers rest when you leave; their position carries over when you cross.

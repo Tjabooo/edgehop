@@ -95,8 +95,10 @@ struct Viewing {
 struct Serving {
     peer: String,
     session: u64,
-    capture: Vec<String>,
-    monitor: watch::Sender<String>,
+    /// What the viewer asked for: fps, kb/s, codec (the quality preset caps it).
+    asked: (u32, u32, String),
+    /// The output to capture and the capture command (with the preset applied).
+    feed: watch::Sender<(String, Vec<String>)>,
     task: Option<Task>,
     /// Sound capture command, when the viewer asked for sound.
     audio_capture: Option<Vec<String>>,
@@ -172,6 +174,11 @@ struct Daemon {
     serving: Option<Serving>,
     /// Next time the watched side checks which output the cursor is on.
     follow_next: Instant,
+    /// Quality preset applied when we're watched (see quality.rs).
+    view_quality: &'static crate::quality::Quality,
+    /// When we last passed a view keypress on to the driver: the view that
+    /// follows opens with the quality picker (`[view] ask_quality`).
+    view_toggle_sent: Option<Instant>,
 }
 
 pub fn socket_path() -> PathBuf {
@@ -319,6 +326,8 @@ pub async fn run(cfg: Config) -> Result<()> {
         psk,
         net_tx: net_tx.clone(),
         view_on: false,
+        view_quality: crate::quality::load(),
+        view_toggle_sent: None,
         viewing: None,
         serving: None,
         follow_next: Instant::now(),
@@ -1115,6 +1124,9 @@ impl Daemon {
             None => (cmd, None),
         };
         if verb == "view" {
+            if let Some(rest) = arg.and_then(|a| a.strip_prefix("quality")) {
+                return self.set_quality(rest.trim());
+            }
             let on = match arg {
                 None | Some("toggle") => None,
                 Some("on") => Some(true),
@@ -1127,6 +1139,7 @@ impl Daemon {
                 // Pressed on the driver's keyboard: remote view is its setting.
                 let peer = cb.peer.clone();
                 self.send(&peer, Msg::ViewToggle { on });
+                self.view_toggle_sent = Some(Instant::now());
                 return format!("asked {peer} to switch remote view\n");
             }
             self.set_view(on);
@@ -1326,17 +1339,16 @@ impl Daemon {
             return;
         }
         let monitor = self.monitor_under_cursor().await.unwrap_or_default();
-        let capture = crate::config::fill(
-            &self.cfg.view.capture,
-            &[
-                ("fps", &fps.to_string()),
-                ("kbps", &kbps.to_string()),
-                ("codec", codec),
-            ],
+        let asked = (fps, kbps, codec.to_string());
+        let capture = self.capture_cmd(&asked);
+        let q = self.view_quality;
+        log::info!(
+            "view: {peer} is watching (starting on {monitor}, quality {})",
+            q.name
         );
-        log::info!("view: {peer} is watching (starting on {monitor})");
-        let (tx, _) = watch::channel(monitor);
+        let (tx, _) = watch::channel((monitor, capture));
         let v = &self.cfg.view;
+        let audio = audio && q.audio;
         let audio_capture = (audio && !v.audio_capture.is_empty()).then(|| {
             view::drop_empty_options(crate::config::fill(
                 &v.audio_capture,
@@ -1346,8 +1358,8 @@ impl Daemon {
         self.serving = Some(Serving {
             peer: peer.to_string(),
             session,
-            capture,
-            monitor: tx,
+            asked,
+            feed: tx,
             task: None,
             audio_capture,
             audio_task: None,
@@ -1357,6 +1369,63 @@ impl Daemon {
         if audio {
             self.dial_video(peer, session, true);
         }
+        // Remote view was just switched on from here: offer the quality picker
+        // (it shows on this screen, i.e. inside the stream the driver watches).
+        if self.cfg.view.ask_quality
+            && self
+                .view_toggle_sent
+                .take()
+                .is_some_and(|t| t.elapsed() < Duration::from_secs(5))
+        {
+            spawn_quality_picker();
+        }
+    }
+
+    /// The capture command for what the viewer asked, with the preset applied.
+    fn capture_cmd(&self, asked: &(u32, u32, String)) -> Vec<String> {
+        let q = self.view_quality;
+        let cmd = crate::config::fill(
+            &self.cfg.view.capture,
+            &[
+                ("fps", &q.fps(asked.0).to_string()),
+                ("kbps", &q.kbps(asked.1).to_string()),
+                ("codec", &asked.2),
+            ],
+        );
+        q.scale(cmd)
+    }
+
+    /// `edgehop view quality [NAME]`: pick the preset used when we're watched;
+    /// a running stream restarts with it right away.
+    fn set_quality(&mut self, name: &str) -> String {
+        if name.is_empty() {
+            return format!(
+                "view quality: {} ({})\npresets: {}\n",
+                self.view_quality.name,
+                self.view_quality.label,
+                crate::quality::names()
+            );
+        }
+        let Some(q) = crate::quality::find(name) else {
+            return format!(
+                "error: unknown quality {name:?} (pick one of {})\n",
+                crate::quality::names()
+            );
+        };
+        self.view_quality = q;
+        crate::quality::save(q);
+        log::info!("view quality: {} ({})", q.name, q.label);
+        if let Some(sv) = &self.serving {
+            let capture = self.capture_cmd(&sv.asked);
+            let sv = self.serving.as_mut().unwrap();
+            // Restarts the recorder, like moving to another output.
+            sv.feed.send_modify(|f| f.1 = capture);
+            if !q.audio {
+                sv.audio_capture = None;
+                sv.audio_task = None;
+            }
+        }
+        format!("view quality: {} ({})\n", q.name, q.label)
     }
 
     /// The sound link of a view came up. Sound is a bonus: when it fails,
@@ -1410,10 +1479,10 @@ impl Daemon {
             return;
         };
         if let Some(sv) = &self.serving
-            && *sv.monitor.borrow() != now
+            && sv.feed.borrow().0 != now
         {
             log::debug!("view: cursor moved to {now}");
-            sv.monitor.send_replace(now);
+            sv.feed.send_modify(|f| f.0 = now);
         }
     }
 
@@ -1451,9 +1520,9 @@ impl Daemon {
             .as_mut()
             .filter(|s| s.peer == peer && s.session == session && s.task.is_none())
         {
-            let (capture, monitor) = (sv.capture.clone(), sv.monitor.subscribe());
+            let feed = sv.feed.subscribe();
             sv.task = Some(Task::spawn(async move {
-                ended(net, view::serve(w, r, capture, monitor).await);
+                ended(net, view::serve(w, r, feed).await);
             }));
         } else {
             log::debug!("{peer}: video link for unknown view {session:x}, dropped");
@@ -1506,9 +1575,10 @@ impl Daemon {
         }
         if let Some(sv) = &self.serving {
             s += &format!(
-                ", streaming {} to {}",
-                sv.monitor.borrow().as_str(),
-                sv.peer
+                ", streaming {} to {} ({} quality)",
+                sv.feed.borrow().0.as_str(),
+                sv.peer,
+                self.view_quality.name
             );
         }
         s += "\n";
@@ -1744,5 +1814,34 @@ mod tests {
             frac = back => println!("handed back at {frac}"),
             _ = swipes => panic!("never handed back"),
         }
+    }
+}
+
+/// Show the quality picker (`edgehop view pick`, a rofi menu) on this screen.
+fn spawn_quality_picker() {
+    let exe = std::env::current_exe()
+        .ok()
+        .map(|p| {
+            // Reinstalled while running: the path gains " (deleted)".
+            let s = p
+                .to_string_lossy()
+                .trim_end_matches(" (deleted)")
+                .to_string();
+            PathBuf::from(s)
+        })
+        .unwrap_or_else(|| PathBuf::from("edgehop"));
+    let child = tokio::process::Command::new(exe)
+        .args(["view", "pick"])
+        .envs(crate::hypr::session_env())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .spawn();
+    match child {
+        Ok(mut c) => {
+            tokio::spawn(async move {
+                let _ = c.wait().await;
+            });
+        }
+        Err(e) => log::warn!("view: can't open the quality picker: {e}"),
     }
 }

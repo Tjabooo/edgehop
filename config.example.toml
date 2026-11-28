@@ -41,6 +41,7 @@ codec = "h264"            # or "hevc"
 # hint = "Super+Alt+L"    # your `edgehop view` keybind, named in notifications
 # audio = true             # hear the machine you watch
 # audio_source = ""        # sent when watched: a PipeWire sink name ("" = default output)
+# ask_quality = true       # view switched on while driving this machine: show a quality picker (rofi) here
 # audio_capture / audio_player: raw s16 stereo 48 kHz PCM out/in ({audio_source} / {peer}).
 # Override the commands if you like. capture prints a raw Annex-B stream of
 # {monitor} to stdout ({fps} {kbps} {codec}); player shows stdin ({codec} {peer}).
